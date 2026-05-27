@@ -82,12 +82,20 @@ class Actuators:
     def take_over(self) -> None:
         """Flip every managed channel to manual mode (1). Caller is responsible
         for writing a sane initial PWM via set_pwm() before takeover.
+
+        Raises RuntimeError if any channel write failed — otherwise the daemon
+        would silently run with the chip still under BIOS control on that
+        channel, and set_all(255) on a critical would no-op.
         """
+        failed: list[str] = []
         for ch, h in self.handles.items():
             try:
                 h.enable_path.write_text("1")
             except OSError as exc:
                 log.error("take_over %s: %s", ch, exc)
+                failed.append(ch)
+        if failed:
+            raise RuntimeError(f"take_over failed for channels: {', '.join(failed)}")
 
     def restore(self) -> None:
         """Restore the modes (and values) captured by snapshot(). If snapshot
@@ -100,12 +108,14 @@ class Actuators:
                 self._snapshot = None
 
         for ch, h in self.handles.items():
-            target_mode = (
-                self._snapshot.get(ch, {}).get("enable", DEFAULT_RESTORE_MODE)
-                if self._snapshot
-                else DEFAULT_RESTORE_MODE
-            )
+            saved = self._snapshot.get(ch, {}) if self._snapshot else {}
+            target_mode = saved.get("enable", DEFAULT_RESTORE_MODE)
             try:
+                # If returning to manual (mode=1), write the captured pwm first
+                # so the channel doesn't sit at fand's last-commanded value
+                # (potentially 255) after we flip enable.
+                if target_mode == 1 and "pwm" in saved:
+                    h.pwm_path.write_text(str(saved["pwm"]))
                 h.enable_path.write_text(str(target_mode))
                 log.info("restored %s -> enable=%d", ch, target_mode)
             except OSError as exc:
@@ -166,16 +176,35 @@ def restore_from_disk(chip_name: str = "nct6799") -> int:
         return 0
     try:
         saved: dict[str, dict[str, int]] = json.loads(SAVED_STATE.read_text())
+        have_snapshot = True
     except (OSError, json.JSONDecodeError) as exc:
         log.warning("restore: saved state missing/invalid (%s); using mode=%d", exc, DEFAULT_RESTORE_MODE)
         saved = {}
+        have_snapshot = False
     n = 0
-    for pwm_enable in sorted(hw.glob("pwm*_enable")):
-        ch = pwm_enable.name.removesuffix("_enable")
-        mode = saved.get(ch, {}).get("enable", DEFAULT_RESTORE_MODE)
-        try:
-            pwm_enable.write_text(str(mode))
-            n += 1
-        except OSError as exc:
-            log.error("restore %s: %s", ch, exc)
+    if have_snapshot:
+        # Restore only the channels fand was actually managing — touching
+        # unmanaged channels would clobber whatever BIOS curve owns them.
+        for ch, vals in saved.items():
+            pwm_path = hw / ch
+            enable_path = hw / f"{ch}_enable"
+            if not enable_path.exists():
+                log.warning("restore: %s not present on chip %s; skipping", ch, chip_name)
+                continue
+            mode = vals.get("enable", DEFAULT_RESTORE_MODE)
+            try:
+                if mode == 1 and "pwm" in vals and pwm_path.exists():
+                    pwm_path.write_text(str(vals["pwm"]))
+                enable_path.write_text(str(mode))
+                n += 1
+            except OSError as exc:
+                log.error("restore %s: %s", ch, exc)
+    else:
+        for pwm_enable in sorted(hw.glob("pwm*_enable")):
+            ch = pwm_enable.name.removesuffix("_enable")
+            try:
+                pwm_enable.write_text(str(DEFAULT_RESTORE_MODE))
+                n += 1
+            except OSError as exc:
+                log.error("restore %s: %s", ch, exc)
     return n

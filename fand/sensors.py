@@ -49,6 +49,16 @@ def _read_int_file(p: Path) -> int | None:
         return None
 
 
+def _safe_float(s: str) -> float:
+    # nvidia-smi emits '[N/A]' for unavailable fields (common for fan.speed on
+    # workstation cards, transient for power.draw). Return 0.0 sentinel rather
+    # than discarding valid sibling readings in the same row.
+    try:
+        return float(s)
+    except ValueError:
+        return 0.0
+
+
 def find_hwmon_by_name(name: str) -> Path | None:
     """Resolve /sys/class/hwmon/hwmonN by chip name (e.g. 'nct6799').
 
@@ -143,15 +153,15 @@ def read_nvidia_gpu() -> dict[str, float] | None:
     line = out.stdout.strip().splitlines()[0] if out.stdout.strip() else ""
     try:
         temp, fan, power, util = (s.strip() for s in line.split(","))
-        return {
-            "temp_c": float(temp),
-            "fan_pct": float(fan),
-            "power_w": float(power),
-            "util_pct": float(util),
-        }
     except ValueError:
         log.warning("nvidia-smi parse failed: %r", line)
         return None
+    return {
+        "temp_c": _safe_float(temp),
+        "fan_pct": _safe_float(fan),
+        "power_w": _safe_float(power),
+        "util_pct": _safe_float(util),
+    }
 
 
 def _read_proc_stat_cpu() -> tuple[int, int] | None:
@@ -210,8 +220,9 @@ class Sensors:
     Stateful only for CPU util (needs two /proc/stat samples to compute %).
     """
 
-    def __init__(self, ups_name: str = "cyberpower"):
+    def __init__(self, ups_name: str = "cyberpower", chip_name: str = "nct6799"):
         self.ups_name = ups_name
+        self.chip_name = chip_name
         self._cpu_last: tuple[int, int] | None = None
         self._chips = find_all_hwmon()
         log.info("hwmon chips found: %s", {k: len(v) for k, v in self._chips.items()})
@@ -229,14 +240,14 @@ class Sensors:
                 except OSError as exc:
                     obs.errors.append(f"hwmon {key}: {exc}")
 
-        nct = find_hwmon_by_name("nct6799")
+        nct = find_hwmon_by_name(self.chip_name)
         if nct is not None:
             try:
                 obs.fans, obs.pwm, obs.pwm_enable = read_hwmon_fans_pwm(nct)
             except OSError as exc:
-                obs.errors.append(f"nct6799 fans/pwm: {exc}")
+                obs.errors.append(f"{self.chip_name} fans/pwm: {exc}")
         else:
-            obs.errors.append("nct6799 not found")
+            obs.errors.append(f"{self.chip_name} not found")
 
         obs.gpu = read_nvidia_gpu()
         if obs.gpu is None:

@@ -47,6 +47,7 @@ HISTORY_PATH = STATE_DIR / "history.jsonl"
 RUN_DIR = Path("/run/fand")
 STATUS_PATH = RUN_DIR / "status.json"
 HISTORY_RETENTION_DAYS = 30
+FAN_DEAD_STREAK = 3  # ~6s at default 2s poll, skips mechanical spin-up on cold start
 
 
 # ---- sd_notify ------------------------------------------------------------
@@ -116,8 +117,19 @@ def _maybe_rotate_history(path: Path, current_day: list[str]) -> None:
     """Rotate path to path.YYYYMMDD.gz when the date changes."""
     today = time.strftime("%Y%m%d", time.localtime())
     if not current_day:
-        current_day.append(today)
-        return
+        # On the first call after startup, seed current_day from the existing
+        # file's mtime — not today — so a cross-midnight restart correctly
+        # archives yesterday's leftover rows under yesterday's date before
+        # today's writes start appending.
+        if path.exists():
+            try:
+                mtime_day = time.strftime("%Y%m%d", time.localtime(path.stat().st_mtime))
+            except OSError:
+                mtime_day = today
+            current_day.append(mtime_day)
+        else:
+            current_day.append(today)
+            return
     if today == current_day[0]:
         return
     # Date changed: gzip the old file
@@ -155,15 +167,19 @@ class Daemon:
         self.equilibrium_window_n = max(8, int(self.equilibrium_window_s / self.poll_interval))
         self.ntfy_cmd = self.config.get("ntfy_command")
         self.history_enabled = bool(self.config.get("history_enabled", True))
+        self.chip_name = self.config.get("chip_name", "nct6799")
 
-        self.sensors = Sensors(ups_name=self.config.get("ups_name", "cyberpower"))
+        self.sensors = Sensors(
+            ups_name=self.config.get("ups_name", "cyberpower"),
+            chip_name=self.chip_name,
+        )
 
         zones = self.zones_cfg.get("zones") or []
         if not zones:
             raise RuntimeError(f"no zones defined in {zones_path}")
 
         channels = [z["pwm_channel"] for z in zones]
-        self.actuators = Actuators(channels)
+        self.actuators = Actuators(channels, chip_name=self.chip_name)
 
         self.zones: list[dict[str, Any]] = zones
         self.models: dict[str, ZoneModel] = {}
@@ -199,22 +215,33 @@ class Daemon:
         self.last_history_day: list[str] = []  # mutable closure for rotation
         self._stop = False
         self._last_alarm_t: dict[str, float] = {}  # de-dup ntfy alerts
+        self._fan_fault_streak: dict[str, int] = {}
 
     def _load_equilibria(self) -> None:
         if not EQUILIBRIA_PATH.exists():
             return
         try:
-            for line in EQUILIBRIA_PATH.read_text().splitlines():
+            lines = EQUILIBRIA_PATH.read_text().splitlines()
+        except OSError as exc:
+            log.warning("equilibria load failed: %s", exc)
+            return
+        skipped = 0
+        for line in lines:
+            if not line.strip():
+                continue
+            try:
                 row = json.loads(line)
                 z = row.pop("zone")
                 if z in self.equilibria:
                     self.equilibria[z].append(EquilibriumSample(**row))
-            log.info(
-                "loaded equilibria: %s",
-                {k: len(v) for k, v in self.equilibria.items()},
-            )
-        except (OSError, json.JSONDecodeError, TypeError) as exc:
-            log.warning("equilibria load failed: %s", exc)
+            except (json.JSONDecodeError, KeyError, TypeError) as exc:
+                log.warning("equilibria line skipped: %s", exc)
+                skipped += 1
+        log.info(
+            "loaded equilibria: %s (skipped %d malformed)",
+            {k: len(v) for k, v in self.equilibria.items()},
+            skipped,
+        )
 
     def _append_equilibrium(self, zone_name: str, sample: EquilibriumSample) -> None:
         self.equilibria[zone_name].append(sample)
@@ -225,6 +252,24 @@ class Daemon:
                 f.write(json.dumps(row) + "\n")
         except OSError as exc:
             log.warning("equilibrium persist failed: %s", exc)
+
+    def _persist_equilibria_atomic(self) -> None:
+        """Rewrite equilibria.jsonl from the in-memory deques (capped at
+        maxlen=5000/zone), bounding the file's growth. Called from the refit
+        block so we truncate at most once per fit_interval; per-tick appends
+        keep happening in between so a crash mid-interval doesn't lose samples.
+        """
+        EQUILIBRIA_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = EQUILIBRIA_PATH.with_suffix(EQUILIBRIA_PATH.suffix + ".tmp")
+        try:
+            with tmp.open("w") as f:
+                for zone_name, samples in self.equilibria.items():
+                    for s in samples:
+                        row = asdict(s) | {"zone": zone_name}
+                        f.write(json.dumps(row) + "\n")
+            tmp.replace(EQUILIBRIA_PATH)
+        except OSError as exc:
+            log.warning("equilibria atomic persist failed: %s", exc)
 
     def _alarm(self, key: str, message: str, cooldown_s: float = 300.0) -> None:
         """Emit an ntfy alert at most once per cooldown for the given key."""
@@ -242,7 +287,6 @@ class Daemon:
         zone_temps: dict[str, float | None] = {}
         zone_critical: dict[str, bool] = {}
         any_critical = False
-        any_sensor_missing = False
         for z in self.zones:
             primary = z["target_sensors"][0]
             T_z = _temp_at(obs, primary["chip"], primary["label"])
@@ -258,7 +302,6 @@ class Daemon:
                     f"= {T_z:.1f}°C ≥ critical {critical_c:.1f}°C",
                 )
             if T_z is None:
-                any_sensor_missing = True
                 self._alarm(
                     f"missing:{z['name']}",
                     f"{z['name']} primary sensor {primary['chip']}/{primary['label']} unreadable",
@@ -288,7 +331,7 @@ class Daemon:
             applied = {z["name"]: 255 for z in self.zones}
             sources = {z["name"]: "critical" for z in self.zones}
         else:
-            T_amb = _temp_at(obs, "nct6799", "SYSTIN") or 25.0
+            T_amb = _temp_at(obs, self.chip_name, "SYSTIN") or 25.0
             features = _build_features(obs)
             for z in self.zones:
                 T_z = zone_temps[z["name"]]
@@ -310,15 +353,22 @@ class Daemon:
             if tach is None:
                 continue
             if applied.get(z["name"], 0) >= z["pwm_min"] and tach < 100:
-                self._alarm(
-                    f"fan_dead:{z['name']}",
-                    f"{z['name']} commanded pwm={applied[z['name']]} but tach={tach} RPM",
-                )
+                streak = self._fan_fault_streak.get(z["name"], 0) + 1
+                self._fan_fault_streak[z["name"]] = streak
+                if streak >= FAN_DEAD_STREAK:
+                    self._alarm(
+                        f"fan_dead:{z['name']}",
+                        f"{z['name']} commanded pwm={applied[z['name']]} but tach={tach} RPM",
+                    )
+            else:
+                self._fan_fault_streak[z["name"]] = 0
 
         # ---- update equilibrium windows + collect training samples ----------
-        if not any_critical and not any_sensor_missing:
+        # Per-zone `if T_z is None: continue` below already guards each zone
+        # individually; one flaky sensor must not halt learning for the others.
+        if not any_critical:
             features = _build_features(obs)
-            T_amb = _temp_at(obs, "nct6799", "SYSTIN") or 25.0
+            T_amb = _temp_at(obs, self.chip_name, "SYSTIN") or 25.0
             for z in self.zones:
                 T_z = zone_temps[z["name"]]
                 if T_z is None:
@@ -342,6 +392,7 @@ class Daemon:
             for name, model in self.models.items():
                 model.fit(list(self.equilibria[name]))
             save_models(MODEL_PATH, self.models)
+            self._persist_equilibria_atomic()
             self.last_fit_t = obs.t
 
         # ---- write status + history -----------------------------------------
@@ -433,7 +484,16 @@ def main(argv: list[str] | None = None) -> int:
     _setup_logging()
 
     if args.restore_bios:
-        n = restore_from_disk()
+        # Read chip_name from config so restore targets the right chip on
+        # non-nct6799 hosts. Restore must never block on parse errors — fall
+        # back to the default and try anyway.
+        chip_name = "nct6799"
+        try:
+            cfg = yaml.safe_load(Path(args.config).read_text()) or {}
+            chip_name = cfg.get("chip_name", chip_name)
+        except (OSError, yaml.YAMLError) as exc:
+            log.warning("restore: config unreadable (%s); using chip=%s", exc, chip_name)
+        n = restore_from_disk(chip_name=chip_name)
         log.info("restored %d channels from %s", n, SAVED_STATE)
         return 0
 

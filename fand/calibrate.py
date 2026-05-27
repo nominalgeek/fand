@@ -99,7 +99,7 @@ def find_pwm_min(actuators: Actuators, hw: Path, channel: str, tach: str | None)
     actuators.set_pwm(channel, 200)
     _settle(3.0)
 
-    last_spinning = 100
+    last_spinning: int | None = None
     for v in range(100, 19, -10):
         actuators.set_pwm(channel, v)
         _settle(3.0)
@@ -108,6 +108,17 @@ def find_pwm_min(actuators: Actuators, hw: Path, channel: str, tach: str | None)
         if rpm < 200:
             break
         last_spinning = v
+    if last_spinning is None:
+        # Fan never spun in the probe range — could be a high-static-pressure
+        # server fan, large 140/200mm, or AIO pump whose real min is >100,
+        # or the fan is dead. Return safe-high so runtime doesn't try to
+        # under-drive it; operator must review pwm_min in zones.yaml.
+        log.warning(
+            "%s: fan never spun in probe range (100..20) — returning safe-high "
+            "default 200; review pwm_min in zones.yaml",
+            channel,
+        )
+        return 200
     # Margin: +20 PWM over the last spinning value, capped at 100
     return min(100, last_spinning + 20)
 
