@@ -1,0 +1,30 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "fand"
+dynamic = ["version"]
+description = "Adaptive system fan controller for Linux"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { file = "LICENSE" }
+authors = [{ name = "Sean T McDermott", email = "stmcdermott@gmail.com" }]
+dependencies = [
+    "numpy>=2.0",
+    "pyyaml>=6.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/nominalgeek/fand"
+
+[project.scripts]
+fand-ctl = "fand.cli:main"
+fand-calibrate = "fand.calibrate:main"
+fand-daemon = "fand.daemon:main"
+
+[tool.hatch.version]
+path = "fand/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["fand"]

@@ -16,6 +16,17 @@ This was extracted from `/opt/comfyui/fand` into its own repo (`github.com:nomin
 - `fand/cli.py` — `fand-ctl status / tail / model` — read-only, any user, no sudo.
 - `systemd/fand.service` — `Type=notify`, `WatchdogSec=10`, `User=root`, narrow `ReadWritePaths=`, `ExecStopPost` restores BIOS modes.
 
+## Install layout (dev checkout vs runtime)
+
+Two locations, on purpose:
+
+- `/opt/fand` — dev checkout. User-owned and editable. **Not** where the daemon runs from.
+- `/usr/local/lib/fand` — runtime. Root-owned. `install.sh` builds a wheel from the dev checkout (`uv build`) and installs it into `.venv/` there as root via `uv pip install`. The wheel's entry points (`fand-daemon`, `fand-ctl`, `fand-calibrate`) land in `.venv/bin/`; `/usr/local/bin/fand-{ctl,calibrate}` are symlinks to them. systemd's `ExecStart` is `.venv/bin/fand-daemon`.
+
+The daemon runs as `User=root`; if its code lived in a user-writable path, any account that can write the dev checkout could inject Python that executes as root on the next service restart. `install.sh` refuses to install if `.venv/bin/python` resolves to a non-root-owned interpreter, and the unit has `ExecStartPre=/usr/bin/test -O …` guards on `fand-daemon` and `.venv/bin/python` as belt-and-braces.
+
+To pick up source changes: edit in `/opt/fand`, then `sudo /opt/fand/install.sh` to re-sync.
+
 ## Hardware context (load-bearing for the box this was built on)
 
 - **GPU**: NVIDIA RTX PRO 6000 Blackwell, 96 GB VRAM. Onboard GPU fans are **not host-controllable** — `nvidia-smi` reads but cannot write fan speed on this card. The Blackwell board fan logic owns them. Treat GPU fan % as an input signal only.
@@ -40,7 +51,8 @@ journalctl -u fand -f
 
 | Action | Command |
 |---|---|
-| Build venv | `cd /opt/fand && uv venv .venv --python python3.12 && uv pip install --python .venv/bin/python -r requirements.txt` |
+| Build dev venv (for interactive use; runtime venv at `/usr/local/lib/fand/.venv` is built by `install.sh`) | `cd /opt/fand && uv venv .venv --python python3.12 && uv pip install --python .venv/bin/python -e .` |
+| Build wheel only (no install) | `cd /opt/fand && uv build --wheel` |
 | Live sensor read (no privileges needed) | `.venv/bin/python -c "from fand.sensors import Sensors; import time; s=Sensors(); s.read_all(); time.sleep(0.3); print(s.read_all())"` |
 | Run daemon directly (debug, not via systemd) | `sudo .venv/bin/python -m fand.daemon` |
 | Restore BIOS fan modes manually | `sudo .venv/bin/python -m fand.daemon --restore-bios` |
@@ -81,7 +93,8 @@ journalctl -u fand -f
 | `fand/cli.py` | `fand-ctl` — read-only inspector. |
 | `etc/config.yaml.example` | Operator-editable tunables. Installed to `/etc/fand/config.yaml`. |
 | `systemd/fand.service` | Unit template installed to `/etc/systemd/system/`. |
-| `install.sh` | Root installer. Builds venv, installs unit + CLI shims, creates dirs. Does NOT start service. |
+| `pyproject.toml` | Package metadata + deps + entry points (`fand-daemon`, `fand-ctl`, `fand-calibrate`). What `uv build` consumes. |
+| `install.sh` | Root installer. Builds a wheel (`uv build`), installs it into a root-owned venv at `/usr/local/lib/fand/.venv`, writes the systemd unit, seeds `/etc/fand`, symlinks CLI shims. Does NOT start service. |
 
 ## State (outside the repo)
 

@@ -1,14 +1,18 @@
 [Unit]
 Description=fand — adaptive system fan controller
-Documentation=file:/opt/fand/
+Documentation=file:/usr/local/lib/fand/
 After=multi-user.target nut-server.service
 Wants=nut-server.service
 
 [Service]
 Type=notify
 NotifyAccess=main
-ExecStart=/opt/fand/.venv/bin/python -m fand.daemon
-ExecStopPost=/opt/fand/.venv/bin/python -m fand.daemon --restore-bios
+# Fail closed if the runtime tree has been tampered with — the daemon runs as
+# root and these are the two paths whose contents become root code on start.
+ExecStartPre=/usr/bin/test -O /usr/local/lib/fand/.venv/bin/fand-daemon
+ExecStartPre=/usr/bin/test -O /usr/local/lib/fand/.venv/bin/python
+ExecStart=/usr/local/lib/fand/.venv/bin/fand-daemon
+ExecStopPost=/usr/local/lib/fand/.venv/bin/fand-daemon --restore-bios
 Restart=on-failure
 RestartSec=5
 WatchdogSec=10
