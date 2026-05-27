@@ -1,0 +1,29 @@
+[Unit]
+Description=fand — adaptive system fan controller
+Documentation=file:/opt/fand/
+After=multi-user.target nut-server.service
+Wants=nut-server.service
+
+[Service]
+Type=notify
+NotifyAccess=main
+ExecStart=/opt/fand/.venv/bin/python -m fand.daemon
+ExecStopPost=/opt/fand/.venv/bin/python -m fand.daemon --restore-bios
+Restart=on-failure
+RestartSec=5
+WatchdogSec=10
+
+# Runs as root because PWM writes need it. Narrow the writable surface so a bug
+# can't corrupt anything beyond the hwmon nodes and our own state dirs.
+User=root
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/sys/class/hwmon /etc/fand /var/lib/fand /run/fand
+StateDirectory=fand
+RuntimeDirectory=fand
+ConfigurationDirectory=fand
+
+[Install]
+WantedBy=multi-user.target
