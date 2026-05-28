@@ -23,9 +23,10 @@ fi
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RUNTIME=/usr/local/lib/fand
 
-if ! command -v uv >/dev/null 2>&1; then
-    echo "error: uv not found in root's PATH. Install uv first, or invoke this" >&2
-    echo "script with sudo -E so root inherits your PATH." >&2
+UV="${UV:-$(command -v uv 2>/dev/null || true)}"
+if [ -z "$UV" ] || ! [ -x "$UV" ]; then
+    echo "error: uv not found. Install uv on root's PATH, or pass its path" >&2
+    echo "explicitly: sudo UV=/path/to/uv $0" >&2
     exit 1
 fi
 
@@ -35,7 +36,7 @@ BUILD_DIR="$(mktemp -d -t fand-build.XXXXXXXX)"
 trap 'rm -rf "$BUILD_DIR"' EXIT
 
 echo "building wheel from $SRC"
-(cd "$SRC" && uv build --wheel --out-dir "$BUILD_DIR")
+(cd "$SRC" && "$UV" build --wheel --out-dir "$BUILD_DIR")
 
 WHEEL="$(ls "$BUILD_DIR"/fand-*.whl 2>/dev/null | head -n 1)"
 if [ -z "$WHEEL" ] || [ ! -f "$WHEEL" ]; then
@@ -50,7 +51,7 @@ cd "$RUNTIME"
 
 if [ ! -d .venv ]; then
     echo "creating venv at $RUNTIME/.venv"
-    uv venv .venv --python python3.12
+    "$UV" venv .venv --python python3.13
 fi
 
 # Whole point: the interpreter the daemon executes as root must live in a
@@ -68,7 +69,7 @@ if [ "$PY_OWNER" != "root" ]; then
 fi
 
 echo "installing $(basename "$WHEEL") into $RUNTIME/.venv"
-uv pip install --python .venv/bin/python --reinstall "$WHEEL"
+"$UV" pip install --python .venv/bin/python --reinstall "$WHEEL"
 
 # Belt-and-braces: tighten ownership across the whole runtime tree. uv run as
 # root should already produce root-owned files; enforcing here means a

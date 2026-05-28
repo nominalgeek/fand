@@ -51,7 +51,7 @@ journalctl -u fand -f
 
 | Action | Command |
 |---|---|
-| Build dev venv (for interactive use; runtime venv at `/usr/local/lib/fand/.venv` is built by `install.sh`) | `cd /opt/fand && uv venv .venv --python python3.12 && uv pip install --python .venv/bin/python -e .` |
+| Build dev venv (for interactive use; runtime venv at `/usr/local/lib/fand/.venv` is built by `install.sh`) | `cd /opt/fand && uv venv .venv --python python3.13 && uv pip install --python .venv/bin/python -e .` |
 | Build wheel only (no install) | `cd /opt/fand && uv build --wheel` |
 | Live sensor read (no privileges needed) | `.venv/bin/python -c "from fand.sensors import Sensors; import time; s=Sensors(); s.read_all(); time.sleep(0.3); print(s.read_all())"` |
 | Run daemon directly (debug, not via systemd) | `sudo .venv/bin/python -m fand.daemon` |
