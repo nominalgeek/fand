@@ -1,2 +1,133 @@
 # fand
-small fan controll utility
+
+Adaptive system fan controller for Linux. Polls hwmon, `nvidia-smi`,
+`/proc/stat`, and a NUT UPS at 2 s; drives Super-I/O PWM channels via a
+per-zone ridge-regression model on equilibrium samples plus AR(1) predictive
+feed-forward — fans lead heat surges from GPU/CPU/UPS load instead of chasing
+them.
+
+Runs as a root `systemd` service. Snapshots BIOS PWM modes on startup and
+restores on shutdown. Unconditional safety floors are independent of the
+learned model: critical temp → all fans to 255, sensor fault → that zone to
+255, dead-fan detection on commanded PWM ≥ pwm_min with zero tach.
+
+## Requirements
+
+- Linux with `systemd`.
+- A Super-I/O chip exposed via kernel hwmon. Default is `nct6799`; set
+  `chip_name` in `/etc/fand/config.yaml` for other chips (the code resolves
+  by the value in `/sys/class/hwmon/*/name`).
+- System Python ≥ 3.12 owned by root (`install.sh` refuses to use an
+  interpreter from a user homedir).
+- [`uv`](https://docs.astral.sh/uv/) — used to build the wheel and the
+  runtime venv. On root's PATH, or pass an explicit path:
+  `sudo UV=/path/to/uv install.sh`.
+- Optional: `nvidia-smi` (NVIDIA GPU temp/fan%/power/util), NUT `upsc`
+  (whole-system AC draw), an `ntfy` script (push alerts). If any of these
+  is missing, that feature defaults to 0 and the daemon logs a warning.
+
+Built and tuned for: NVIDIA RTX PRO 6000 Blackwell (GPU fans are not
+host-controllable on this card — fan% is treated as input only), AMD 9950X3D
+(via `k10temp`/Tctl), DDR5 with `spd5118` modules, `nct6799` Super-I/O.
+Should work on any Linux box with a supported Super-I/O after editing
+`chip_name` and re-running `fand-calibrate`.
+
+## Install
+
+```bash
+git clone https://github.com/nominalgeek/fand
+sudo fand/install.sh
+```
+
+`install.sh` builds a wheel from the checkout, installs it into a root-owned
+venv at `/usr/local/lib/fand/.venv`, writes `/etc/systemd/system/fand.service`,
+seeds `/etc/fand/config.yaml`, and symlinks `fand-ctl` + `fand-calibrate` into
+`/usr/local/bin/`. It does **not** start the service.
+
+The checkout (wherever you cloned it) stays editable and is **not** where the
+daemon runs from. To pick up source changes, re-run `sudo install.sh`.
+
+## Bring up
+
+```bash
+sudo fand-calibrate                 # ~5 min, system MUST be idle
+sudo $EDITOR /etc/fand/zones.yaml   # set target_sensors per zone
+sudo systemctl start fand
+fand-ctl status
+journalctl -u fand -f
+```
+
+`fand-calibrate` does a PWM perturbation sweep — it spins each managed fan
+up and down individually to discover which PWM drives which tach and the
+minimum PWM at which each fan reliably spins, then writes a template
+`zones.yaml` with one zone per (PWM, responding fan) pair. You fill in
+`target_sensors` (which temps each zone should hold under control) by hand,
+based on physical case layout — no probe can tell us "this is the front
+intake vs the rear exhaust."
+
+Run with the system fully idle (stop ML training, encoding, etc.) and be
+at the desk to hear what's ramping. The sweep takes about 5 minutes.
+
+## Operating
+
+| Command | Purpose |
+|---|---|
+| `fand-ctl status` | Live zone temps, applied PWMs, model state |
+| `fand-ctl tail -n 50` | Recent poll history from `history.jsonl` |
+| `fand-ctl model` | Learned ridge-regression coefficients per zone |
+| `sudo systemctl {start,stop,restart} fand` | Service control |
+| `journalctl -u fand -f` | Live daemon logs |
+
+`fand-ctl` is read-only and needs no sudo. Live status JSON is at
+`/run/fand/status.json` (world-readable) for monitoring tools.
+
+## How it works
+
+Every 2 s the daemon:
+
+- Reads all sensors. For each zone, checks its primary target sensor against
+  `critical_c` — if exceeded, drives **all** fans to 255 and emits an alarm.
+- Otherwise predicts PWM from `(features, T_zone, T_ambient)` using the
+  learned ridge regression, or the operator's bootstrap curve until ≥ 200
+  equilibrium samples and R² ≥ 0.7 are reached.
+- Detects equilibrium (low dT/dt + low feature variance over a 30 s window)
+  and persists the sample to `equilibria.jsonl` for the next refit.
+- Refits each zone hourly (`fit_interval_s`).
+- Adds an AR(1) surge bump from the EMA of the feature vector, so fan speed
+  ramps *before* temps rise on a GPU/CPU/UPS load step.
+
+Persistent state survives restarts:
+
+- `/var/lib/fand/model.json` — learned ridge coefficients per zone
+- `/var/lib/fand/equilibria.jsonl` — equilibrium training pool
+- `/var/lib/fand/saved_pwm.json` — original PWM modes captured at startup
+- `/var/lib/fand/history.jsonl` — per-poll observation log (gzip-rotated
+  daily, 30-day retention)
+
+## Configuration
+
+`/etc/fand/config.yaml` — daemon tunables. The full annotated list is in
+[`etc/config.yaml.example`](etc/config.yaml.example). Most-edited fields:
+`chip_name`, `poll_interval_s`, `fit_interval_s`, `ridge_lambda`,
+`min_samples_to_learn`, `min_r2_to_learn`, `margin_c`, `ff_alpha`,
+`ups_name`, `ntfy_command`.
+
+`/etc/fand/zones.yaml` — per-zone definitions. Generated by `fand-calibrate`,
+then operator-edited. Each zone has `name`, `pwm_channel`, `fan_tach`,
+`pwm_min`, a list of `target_sensors` (`{chip, label, target_c, critical_c}`),
+and a `bootstrap_curve` used before the learned model passes its hysteresis
+gates.
+
+## Uninstall
+
+```bash
+sudo systemctl stop fand
+sudo systemctl disable fand
+sudo rm /etc/systemd/system/fand.service /usr/local/bin/fand-{ctl,calibrate}
+sudo rm -rf /etc/fand /var/lib/fand /usr/local/lib/fand
+sudo systemctl daemon-reload
+```
+
+## License
+
+MIT — see [LICENSE](LICENSE).
