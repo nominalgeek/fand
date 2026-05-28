@@ -153,11 +153,15 @@ class Actuators:
 
     def __enter__(self) -> "Actuators":
         self.snapshot()
-        # Drive every managed channel to a safe-ish 60% before flipping to manual
-        # so we never hit "manual mode with stale 0% pwm" during the transition.
+        # Flip to manual mode first — the nct kernel driver rejects pwm writes
+        # while pwm_enable is in mode 5 (BIOS SmartFan), so the old order
+        # (set_pwm then take_over) failed every initial write with EBUSY. The
+        # chip preserves the duty register across the mode change, so for a
+        # few microseconds we drive at the BIOS curve's last value before
+        # overriding to a safe-ish 60% start.
+        self.take_over()
         for ch in self.handles:
             self.set_pwm(ch, 160)
-        self.take_over()
         return self
 
     def __exit__(self, *exc) -> None:
