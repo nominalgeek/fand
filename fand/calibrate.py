@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -55,6 +56,30 @@ def _read_tach(hw: Path, fan_key: str) -> int:
 def _settle(seconds: float) -> None:
     log.info("  settle %.0fs...", seconds)
     time.sleep(seconds)
+
+
+def _check_no_daemon_running() -> None:
+    """Refuse to run if fand.service is active. The daemon writes PWM values
+    every poll interval; if it's running during calibration it overwrites
+    every probe and produces garbage data (phase 1 deltas collapse to noise,
+    phase 3 sees no temp delta because the daemon counter-acts the drop).
+    """
+    try:
+        result = subprocess.run(
+            ["systemctl", "is-active", "--quiet", "fand.service"],
+            check=False,
+            timeout=5,
+        )
+    except (subprocess.SubprocessError, FileNotFoundError):
+        # systemctl unavailable — can't check, proceed and hope.
+        return
+    if result.returncode == 0:
+        log.error("fand.service is currently active and will fight every PWM write.")
+        log.error("Stop the daemon first, run this, then start it again with the new zones:")
+        log.error("    sudo systemctl stop fand")
+        log.error("    sudo fand-calibrate")
+        log.error("    sudo systemctl start fand")
+        sys.exit(3)
 
 
 def _average_temps(
@@ -247,7 +272,7 @@ def attribute_fans(
         deltas.sort(key=lambda x: -x[2])
         top = deltas[:ATTRIBUTION_TOP_N]
         if top:
-            summary = ", ".join(f"{c}/{l} (Δ{d:+.1f}°C)" for c, l, d in top)
+            summary = ", ".join(f"{c}/{lbl} (Δ{d:+.1f}°C)" for c, lbl, d in top)
             log.info("  -> %s attributed to: %s", target, summary)
         else:
             log.info(
@@ -344,6 +369,8 @@ def main(argv: list[str] | None = None) -> int:
     if os.geteuid() != 0:
         log.error("calibrate must be run as root (PWM writes need it)")
         return 1
+
+    _check_no_daemon_running()
 
     hw = find_hwmon_by_name(args.chip)
     if hw is None:
