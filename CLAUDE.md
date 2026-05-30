@@ -2,7 +2,9 @@
 
 ## What this is
 
-`fand` is an **adaptive system fan controller** for Linux hosts using the nct6799 Super-I/O chip. Runs as a root systemd service. Polls hwmon temps + nvidia-smi (GPU temp / fan% / power / util) + `/proc/stat` (CPU util) + NUT `upsc` (whole-system AC draw) at 2 s and drives the chip's PWM channels via a per-zone ridge-regression model on equilibrium samples plus AR(1) predictive feed-forward (anticipates heat surges from load before temps rise).
+`fand` is an **autonomous multi-fan multi-sensor thermal controller** for Linux hosts using the nct6799 Super-I/O chip. Runs as a root systemd service. Polls hwmon temps + nvidia-smi (GPU temp / fan% / power / util) + `/proc/stat` (CPU util) + NUT `upsc` (whole-system AC draw) at 2 s. Every fan responds to stresses across every sensor it can affect, weighted by a learned cooling-coefficient matrix. AR(1) predictive feed-forward anticipates heat surges before temps rise.
+
+**Project goal & architecture rationale: see [DESIGN.md](DESIGN.md).** The TL;DR is that fand is for systems where the operator doesn't know which fan cools what — declare sensors and fans, let the daemon learn the relationships from runtime equilibrium samples.
 
 This was extracted from `/opt/comfyui/fand` into its own repo (`github.com:nominalgeek/fand.git`) on 2026-05-27. The `/opt/comfyui` workspace it came out of is the ML host that motivated this — see notes about the hardware context below.
 
@@ -10,10 +12,10 @@ This was extracted from `/opt/comfyui/fand` into its own repo (`github.com:nomin
 
 - `fand/sensors.py` — hwmon by chip name (NOT index — kernel updates shift indices), `nvidia-smi`, `/proc/stat`, `upsc`. All readers tolerate missing sources.
 - `fand/actuators.py` — PWM writer with snapshot/restore. Captures original `pwm*_enable` to `/var/lib/fand/saved_pwm.json` on startup, flips to mode 1 (manual), restores on exit. `--restore-bios` falls back to mode 5 if snapshot missing.
-- `fand/model.py` — per-zone ridge regression on equilibrium samples (form: `T_z - T_amb = (load·θ)/max(PWM - PWM₀, 1)`) + AR(1) EMA-based surge bump. Bootstrap curves used until ≥200 equilibrium samples AND R² ≥ 0.7.
-- `fand/daemon.py` — main loop, `sd_notify` watchdog, unconditional safety floors, status JSON + history JSONL (gzip rotated daily).
-- `fand/calibrate.py` — operator-supervised PWM perturbation sweep → discovers PWM↔fan-tach mapping + `pwm_min` per channel → template `/etc/fand/zones.yaml`.
-- `fand/cli.py` — `fand-ctl status / tail / model` — read-only, any user, no sudo.
+- `fand/model.py` — `SensorModel` (one per declared sensor): per-sensor ridge regression `T_s ≈ baseline + Σ α·feature − Σ γ·pwm` on equilibrium samples. Helpers: `aggregate_demand` (weighted-stress control law), `is_fan_equilibrium` (per-fan steady-state detector). AR(1) feed-forward per sensor (disabled while α untrained).
+- `fand/daemon.py` — main loop, schema parser + auto-translator for old `zones:` format, `sd_notify` watchdog, unconditional safety floors, status JSON + history JSONL (gzip rotated daily).
+- `fand/calibrate.py` — operator-supervised PWM perturbation sweep → discovers PWM↔fan-tach mapping + `pwm_min` per channel + phase-3 ΔT seed weights → writes new-schema `/etc/fand/zones.yaml`.
+- `fand/cli.py` — `fand-ctl status / tail / model` — read-only, any user, no sudo. v2 status display: sensor table + fan table with stress/relevance breakdown.
 - `systemd/fand.service` — `Type=notify`, `WatchdogSec=10`, `User=root`, narrow `ReadWritePaths=`, `ExecStopPost` restores BIOS modes.
 
 ## Install layout (dev checkout vs runtime)
@@ -40,12 +42,14 @@ If a different host has a different Super-I/O chip, code finds it by name (`find
 
 ```
 sudo /opt/fand/install.sh
-sudo fand-calibrate                 # ~5 min, system MUST be idle for clean attribution
-sudo $EDITOR /etc/fand/zones.yaml   # set target_sensors per zone
+sudo fand-calibrate                 # ~15 min total: phases 1+2 idle, phase 3 under load
+sudo $EDITOR /etc/fand/zones.yaml   # review sensor target_c/critical_c; trim sensors:
 sudo systemctl start fand
 fand-ctl status
 journalctl -u fand -f
 ```
+
+Phase 3 of calibrate writes seed cooling weights (ΔT °C per sensor) into each fan's `cools:` dict. The daemon uses those until enough equilibrium samples accumulate to fit per-sensor `γ_p(s)` coefficients (~hours to a day under typical load).
 
 ## Common operations
 
@@ -56,7 +60,7 @@ journalctl -u fand -f
 | Live sensor read (no privileges needed) | `.venv/bin/python -c "from fand.sensors import Sensors; import time; s=Sensors(); s.read_all(); time.sleep(0.3); print(s.read_all())"` |
 | Run daemon directly (debug, not via systemd) | `sudo .venv/bin/python -m fand.daemon` |
 | Restore BIOS fan modes manually | `sudo .venv/bin/python -m fand.daemon --restore-bios` |
-| Calibrate (root, system idle, ~5 min) | `sudo fand-calibrate` |
+| Calibrate (root, ~15 min: idle for phases 1+2, load for phase 3) | `sudo fand-calibrate` |
 | Service control | `sudo systemctl {start,stop,restart,status} fand` |
 | Live status | `fand-ctl status` |
 | Recent observation history | `fand-ctl tail --compact -n 50` |
@@ -75,21 +79,23 @@ journalctl -u fand -f
 ## Conventions
 
 - Find hwmon devices by chip **name**, never by `hwmon3`-style index. Indices shift on kernel updates.
-- Sensor functions return `None` on failure; the daemon's safety floors (`set_all(255)` on critical, per-zone 255 on sensor fault) are the backstop. Never raise from a sensor reader.
-- Per-zone state is persistent (`/var/lib/fand/model.json`, `equilibria.jsonl`) and survives daemon restarts. `history.jsonl` rotates daily, 30 d retention.
+- Multi-instance chips (`nvme[0]`, `spd5118[1]`) require explicit indexing in `zones.yaml`'s sensor declarations — no fuzzy fallback.
+- Sensor functions return `None` on failure; the daemon's safety floors (`set_all(255)` on any sensor crossing `critical_c`) are the backstop. Never raise from a sensor reader.
+- Per-sensor learned state is persistent (`/var/lib/fand/model.json` — `cooling_coefs`, `load_coefs`, `baseline`, `r²`, `n_samples` per sensor) and survives daemon restarts. `equilibria.jsonl` holds the rolling training pool. `history.jsonl` rotates daily, 30 d retention.
 - The daemon writes `/run/fand/status.json` every poll atomically (`tempfile` + `os.replace`). Any monitor (Prometheus exporter, dashboard) should scrape that, not the daemon directly.
-- Critical/target temps are operator-set in `zones.yaml`, **not** hardcoded — there are no good universal defaults across cases / cooler choices.
+- Sensor `target_c` and `critical_c` are operator-set in `zones.yaml`, **not** hardcoded — defaults are conservative but each rig wants tuning. Same for each fan's `cools:` list (initial seed weights come from `fand-calibrate`; operator can edit).
 - UPS feature, NUT loopback, nvidia-smi are all **optional**. If any is missing, the daemon runs without it (load feature defaults to 0; warning logged). `Wants=` not `Requires=` in the systemd unit.
 
 ## Key files
 
 | File | Role |
 |---|---|
+| `DESIGN.md` | Project goal, architectural rationale, control law derivation, learning timeline. Read this before touching `model.py`. |
 | `fand/sensors.py` | Sensor poll surface; everything that reads hardware lives here. |
 | `fand/actuators.py` | Everything that writes PWM lives here. Context-managed snapshot/restore. |
-| `fand/model.py` | Math. Per-zone ridge regression + AR(1) feed-forward. numpy only. |
-| `fand/daemon.py` | Glue + safety + persistence + sd_notify. Most behavior lives here, not in `model.py`. |
-| `fand/calibrate.py` | One-shot PWM perturbation sweep. Operator runs once at install time. |
+| `fand/model.py` | Math. Per-sensor ridge regression with non-negative `γ` cooling coefs, weighted-stress control law (`aggregate_demand`), AR(1) FF, per-fan equilibrium detection. numpy only. |
+| `fand/daemon.py` | Glue + schema parsing + auto-translator + safety + persistence + sd_notify. Most behavior lives here, not in `model.py`. |
+| `fand/calibrate.py` | One-shot PWM perturbation sweep + phase-3 attribution. Writes v2-schema `zones.yaml`. Operator runs once at install time. |
 | `fand/cli.py` | `fand-ctl` — read-only inspector. |
 | `etc/config.yaml.example` | Operator-editable tunables. Installed to `/etc/fand/config.yaml`. |
 | `systemd/fand.service` | Unit template installed to `/etc/systemd/system/`. |
@@ -101,9 +107,9 @@ journalctl -u fand -f
 | Path | Owner | Purpose |
 |---|---|---|
 | `/etc/fand/config.yaml` | operator | Tunables (poll interval, thresholds, ff_alpha, ntfy hook) |
-| `/etc/fand/zones.yaml` | calibrator → operator | Zone definitions: PWM channel, fan tach, target sensors, bootstrap curve |
-| `/var/lib/fand/model.json` | daemon | Learned coefficients per zone |
-| `/var/lib/fand/equilibria.jsonl` | daemon | Persisted equilibrium samples (survive restarts) |
-| `/var/lib/fand/history.jsonl{,.YYYYMMDD.gz}` | daemon | Per-poll observation log |
+| `/etc/fand/zones.yaml` | calibrator → operator | v2 schema: `defaults`, `sensors:` catalog with target/critical, `fans:` dict with `cools:` seed weights |
+| `/var/lib/fand/model.json` | daemon | v2: per-sensor `baseline`, `load_coefs` (α), `cooling_coefs` (γ), `r²`, `n_samples` |
+| `/var/lib/fand/equilibria.jsonl` | daemon | v2: per-fan equilibrium rows with feature/PWM/temp snapshots |
+| `/var/lib/fand/history.jsonl{,.YYYYMMDD.gz}` | daemon | Per-poll observation log (status JSON v2) |
 | `/var/lib/fand/saved_pwm.json` | daemon | Original PWM enable modes (for restore) |
-| `/run/fand/status.json` | daemon | Live atomic-write status (world-readable) |
+| `/run/fand/status.json` | daemon | Live atomic-write status v2 (world-readable) |

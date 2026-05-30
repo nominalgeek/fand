@@ -1,8 +1,24 @@
-"""fand main daemon.
+"""fand main daemon — autonomous multi-sensor multi-fan control.
 
 Run modes:
-  python -m fand.daemon                       # main poll loop (systemd Type=notify)
-  python -m fand.daemon --restore-bios        # ExecStopPost: restore pwm enable modes and exit
+  fand-daemon                       # main poll loop (systemd Type=notify)
+  fand-daemon --restore-bios        # ExecStopPost: restore pwm enable modes and exit
+
+Each tick (default 2 s):
+
+  1. Read every declared sensor (chip+label lookup against the hwmon observation).
+  2. Apply per-sensor AR(1) feed-forward correction to predict near-term ΔT
+     (disabled while that sensor's α coefs are untrained).
+  3. Critical floor: any sensor at/above its `critical_c` → set_all(255) + alarm.
+  4. Otherwise, per fan, compute demand via the weighted-stress rule in
+     `model.aggregate_demand` and set_pwm.
+  5. Per-fan equilibrium detection: when a fan's PWM has been stable, the
+     sensors it cools have low dT/dt, and load features are stable, record a
+     row to equilibria.jsonl.
+  6. Periodic refit: solve per-sensor ridge regression on the rolling sample
+     pool; write model.json.
+
+See DESIGN.md for why we got here from a per-zone architecture.
 """
 
 from __future__ import annotations
@@ -11,7 +27,6 @@ import argparse
 import gzip
 import json
 import logging
-import logging.handlers
 import os
 import shutil
 import signal
@@ -20,7 +35,7 @@ import subprocess
 import sys
 import time
 from collections import deque
-from dataclasses import asdict
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -28,9 +43,12 @@ import yaml
 
 from .actuators import Actuators, SAVED_STATE, restore_from_disk
 from .model import (
+    FEATURE_NAMES,
     EquilibriumSample,
-    ZoneModel,
-    is_equilibrium,
+    SensorModel,
+    aggregate_demand,
+    demand_to_pwm,
+    is_fan_equilibrium,
     load_models_into,
     save_models,
 )
@@ -48,6 +66,7 @@ RUN_DIR = Path("/run/fand")
 STATUS_PATH = RUN_DIR / "status.json"
 HISTORY_RETENTION_DAYS = 30
 FAN_DEAD_STREAK = 3  # ~6s at default 2s poll, skips mechanical spin-up on cold start
+EQUILIBRIA_MAXLEN = 20000
 
 
 # ---- sd_notify ------------------------------------------------------------
@@ -80,25 +99,26 @@ def _atomic_write_json(path: Path, payload: Any) -> None:
 
 
 def _temp_at(obs: Observation, chip: str, label: str) -> float | None:
-    """Look up a temperature reading from the observation's hwmon dict."""
-    if obs.hwmon.get(chip) and label in obs.hwmon[chip]:
-        return obs.hwmon[chip][label]
-    # Some chips appear with [i] suffix when duplicated (e.g. nvme[0], nvme[1]).
-    for key, temps in obs.hwmon.items():
-        if key.startswith(chip + "[") and label in temps:
-            return temps[label]
-    # GPU is queried separately
-    if chip == "gpu" and obs.gpu and label in obs.gpu:
-        return obs.gpu[label]
-    return None
+    """Look up a temperature reading. Requires explicit chip name (including
+    any `[i]` suffix for multi-instance chips like `nvme[0]`, `spd5118[1]`).
+
+    The special chip name `gpu` routes to the NVIDIA reading from nvidia-smi.
+    """
+    if chip == "gpu":
+        return obs.gpu.get(label) if obs.gpu else None
+    chip_temps = obs.hwmon.get(chip)
+    if chip_temps is None:
+        return None
+    return chip_temps.get(label)
 
 
-def _build_features(obs: Observation) -> list[float]:
-    util_gpu = obs.gpu["util_pct"] if obs.gpu else 0.0
-    power_gpu = obs.gpu["power_w"] if obs.gpu else 0.0
-    util_cpu = obs.cpu_util if obs.cpu_util is not None else 0.0
-    ups_w = obs.ups["realpower_w"] if obs.ups else 0.0
-    return [util_gpu, power_gpu, util_cpu, ups_w]
+def _build_features(obs: Observation) -> dict[str, float]:
+    return {
+        "util_gpu": obs.gpu["util_pct"] if obs.gpu else 0.0,
+        "power_gpu_w": obs.gpu["power_w"] if obs.gpu else 0.0,
+        "util_cpu": obs.cpu_util if obs.cpu_util is not None else 0.0,
+        "ups_w": obs.ups["realpower_w"] if obs.ups else 0.0,
+    }
 
 
 def _ntfy(cmd: str | None, message: str) -> None:
@@ -117,10 +137,6 @@ def _maybe_rotate_history(path: Path, current_day: list[str]) -> None:
     """Rotate path to path.YYYYMMDD.gz when the date changes."""
     today = time.strftime("%Y%m%d", time.localtime())
     if not current_day:
-        # On the first call after startup, seed current_day from the existing
-        # file's mtime — not today — so a cross-midnight restart correctly
-        # archives yesterday's leftover rows under yesterday's date before
-        # today's writes start appending.
         if path.exists():
             try:
                 mtime_day = time.strftime("%Y%m%d", time.localtime(path.stat().st_mtime))
@@ -132,7 +148,6 @@ def _maybe_rotate_history(path: Path, current_day: list[str]) -> None:
             return
     if today == current_day[0]:
         return
-    # Date changed: gzip the old file
     if path.exists():
         archived = path.with_name(f"{path.name}.{current_day[0]}.gz")
         try:
@@ -143,7 +158,6 @@ def _maybe_rotate_history(path: Path, current_day: list[str]) -> None:
         except OSError as exc:
             log.warning("history rotate failed: %s", exc)
     current_day[0] = today
-    # Prune old archives
     cutoff = time.time() - HISTORY_RETENTION_DAYS * 86400
     for old in path.parent.glob(f"{path.name}.*.gz"):
         try:
@@ -154,16 +168,151 @@ def _maybe_rotate_history(path: Path, current_day: list[str]) -> None:
             pass
 
 
+# ---- config dataclasses ---------------------------------------------------
+
+
+@dataclass
+class SensorConfig:
+    name: str
+    chip: str
+    label: str
+    target_c: float
+    critical_c: float
+
+
+@dataclass
+class FanConfig:
+    name: str           # also the dict key in zones.yaml
+    pwm_channel: str    # PWM channel on the Super-I/O (defaults to name)
+    fan_tach: str | None
+    pwm_min: int
+    cools: dict[str, float] = field(default_factory=dict)  # sensor_name → seed weight
+
+
+# ---- schema parse + auto-translator --------------------------------------
+
+
+def _is_old_schema(cfg: dict[str, Any]) -> bool:
+    """Old schema has a top-level `zones:` list; new has `sensors:` + `fans:`."""
+    return "zones" in cfg and "sensors" not in cfg
+
+
+def _slug(s: str) -> str:
+    """Lowercase, alphanumeric + underscore; collapse runs of non-alnum."""
+    out_chars: list[str] = []
+    prev_under = False
+    for c in s:
+        if c.isalnum():
+            out_chars.append(c.lower())
+            prev_under = False
+        elif not prev_under:
+            out_chars.append("_")
+            prev_under = True
+    return "".join(out_chars).strip("_") or "sensor"
+
+
+def _translate_old_schema(cfg: dict[str, Any], default_pwm_min: int = 40) -> dict[str, Any]:
+    """Translate old zones.yaml schema to new sensors+fans schema.
+
+    Each unique (chip, label) becomes a sensors entry; each old zone becomes
+    a fans entry with `cools:` populated as uniform-weight seed dict. Real
+    weights come from re-running `fand-calibrate` after the translation lands.
+    """
+    sensors_out: dict[str, dict[str, Any]] = {}
+    fans_out: dict[str, dict[str, Any]] = {}
+    sensor_name_for: dict[tuple[str, str], str] = {}
+
+    # Pass 1: collect sensors from all zones' target_sensors
+    for zone in cfg.get("zones") or []:
+        for ts in zone.get("target_sensors") or []:
+            chip = str(ts.get("chip", ""))
+            label = str(ts.get("label", ""))
+            if not chip or not label:
+                continue
+            key = (chip, label)
+            if key in sensor_name_for:
+                continue
+            base_name = _slug(f"{chip}_{label}")
+            name = base_name
+            i = 2
+            while name in sensors_out:
+                name = f"{base_name}_{i}"
+                i += 1
+            sensor_name_for[key] = name
+            sensors_out[name] = {
+                "chip": chip,
+                "label": label,
+                "target_c": float(ts.get("target_c", 65.0)),
+                "critical_c": float(ts.get("critical_c", 90.0)),
+            }
+
+    # Pass 2: build fans entries
+    for zone in cfg.get("zones") or []:
+        fan_name = str(zone.get("pwm_channel") or zone.get("name") or "")
+        if not fan_name:
+            continue
+        cools: dict[str, float] = {}
+        for ts in zone.get("target_sensors") or []:
+            chip = str(ts.get("chip", ""))
+            label = str(ts.get("label", ""))
+            key = (chip, label)
+            if key in sensor_name_for:
+                cools[sensor_name_for[key]] = 1.0
+        fan_entry: dict[str, Any] = {}
+        if zone.get("fan_tach"):
+            fan_entry["fan_tach"] = zone["fan_tach"]
+        if zone.get("pwm_min") is not None:
+            fan_entry["pwm_min"] = int(zone["pwm_min"])
+        fan_entry["cools"] = cools
+        fans_out[fan_name] = fan_entry
+
+    return {
+        "defaults": {"pwm_min": default_pwm_min},
+        "sensors": sensors_out,
+        "fans": fans_out,
+    }
+
+
+def _maybe_auto_translate(zones_path: Path, cfg: dict[str, Any]) -> None:
+    """If cfg is old-schema, write a translated file alongside and exit with a
+    helpful message. Daemon won't start on old schema."""
+    if not _is_old_schema(cfg):
+        return
+    translated_path = zones_path.with_suffix(zones_path.suffix + ".translated")
+    new_cfg = _translate_old_schema(cfg)
+    try:
+        translated_path.write_text(yaml.safe_dump(new_cfg, sort_keys=False, default_flow_style=False))
+    except OSError as exc:
+        log.error("auto-translate write failed (%s); refusing to start", exc)
+        sys.exit(2)
+
+    log.error("zones.yaml is in the old per-zone schema — refusing to start.")
+    log.error("Wrote translated v2 schema to: %s", translated_path)
+    log.error("Review it, then:")
+    log.error("    sudo mv %s %s", translated_path, zones_path)
+    log.error("    sudo systemctl restart fand")
+    log.error("After that runs, re-run `sudo fand-calibrate` to populate phase-3 cooling weights")
+    log.error("(translator used uniform seed weights of 1.0; calibrate replaces with measured ΔT).")
+    sys.exit(2)
+
+
 # ---- main daemon class ----------------------------------------------------
 
 
 class Daemon:
     def __init__(self, config_path: Path = CONFIG_PATH, zones_path: Path = ZONES_PATH):
         self.config = yaml.safe_load(config_path.read_text()) or {}
-        self.zones_cfg = yaml.safe_load(zones_path.read_text()) or {}
+        zones_cfg = yaml.safe_load(zones_path.read_text()) or {}
+
+        # Auto-translator: exits if old schema detected.
+        _maybe_auto_translate(zones_path, zones_cfg)
+
         self.poll_interval = float(self.config.get("poll_interval_s", 2.0))
         self.fit_interval = float(self.config.get("fit_interval_s", 3600.0))
         self.equilibrium_window_s = float(self.config.get("equilibrium_window_s", 30.0))
+        self.equilibrium_pwm_stable_s = float(
+            self.config.get("equilibrium_pwm_stable_s", 30.0)
+        )
         self.equilibrium_window_n = max(8, int(self.equilibrium_window_s / self.poll_interval))
         self.ntfy_cmd = self.config.get("ntfy_command")
         self.history_enabled = bool(self.config.get("history_enabled", True))
@@ -174,48 +323,90 @@ class Daemon:
             chip_name=self.chip_name,
         )
 
-        zones = self.zones_cfg.get("zones") or []
-        if not zones:
-            raise RuntimeError(f"no zones defined in {zones_path}")
+        defaults = zones_cfg.get("defaults") or {}
+        default_pwm_min = int(defaults.get("pwm_min", 40))
 
-        channels = [z["pwm_channel"] for z in zones]
-        self.actuators = Actuators(channels, chip_name=self.chip_name)
+        sensors_raw = zones_cfg.get("sensors") or {}
+        if not sensors_raw:
+            raise RuntimeError(f"no sensors defined in {zones_path}")
+        fans_raw = zones_cfg.get("fans") or {}
+        if not fans_raw:
+            raise RuntimeError(f"no fans defined in {zones_path}")
 
-        self.zones: list[dict[str, Any]] = zones
-        self.models: dict[str, ZoneModel] = {}
-        for z in zones:
-            primary = z["target_sensors"][0]
-            self.models[z["name"]] = ZoneModel(
-                name=z["name"],
-                pwm_min=int(z["pwm_min"]),
-                target_c=float(primary["target_c"]),
-                critical_c=float(primary.get("critical_c", 90.0)),
-                bootstrap_curve=[(float(t), int(p)) for t, p in z.get("bootstrap_curve", [
-                    (40.0, 100), (60.0, 160), (75.0, 210), (85.0, 255)
-                ])],
+        self.sensor_configs: dict[str, SensorConfig] = {}
+        for name, sc in sensors_raw.items():
+            self.sensor_configs[name] = SensorConfig(
+                name=str(name),
+                chip=str(sc["chip"]),
+                label=str(sc["label"]),
+                target_c=float(sc["target_c"]),
+                critical_c=float(sc["critical_c"]),
+            )
+
+        self.fan_configs: dict[str, FanConfig] = {}
+        for name, fc in fans_raw.items():
+            cools_raw = fc.get("cools") or {}
+            self.fan_configs[name] = FanConfig(
+                name=str(name),
+                pwm_channel=str(fc.get("pwm_channel") or name),
+                fan_tach=str(fc["fan_tach"]) if fc.get("fan_tach") else None,
+                pwm_min=int(fc.get("pwm_min", default_pwm_min)),
+                cools={str(k): float(v) for k, v in cools_raw.items()},
+            )
+
+        # Each sensor's cools_seeds dict: {fan_name → seed_weight from that fan's cools entry}
+        cools_seeds_by_sensor: dict[str, dict[str, float]] = {
+            sn: {} for sn in self.sensor_configs
+        }
+        for fn, fc in self.fan_configs.items():
+            for sn, weight in fc.cools.items():
+                if sn not in self.sensor_configs:
+                    log.warning(
+                        "fan %s lists unknown sensor %s — ignoring (typo in zones.yaml?)",
+                        fn, sn,
+                    )
+                    continue
+                cools_seeds_by_sensor[sn][fn] = weight
+
+        # Per-sensor models
+        self.sensor_models: dict[str, SensorModel] = {}
+        for name, sc in self.sensor_configs.items():
+            self.sensor_models[name] = SensorModel(
+                name=name,
+                target_c=sc.target_c,
+                critical_c=sc.critical_c,
+                cools_seeds=cools_seeds_by_sensor.get(name, {}),
                 ridge_lambda=float(self.config.get("ridge_lambda", 1.0)),
                 min_samples=int(self.config.get("min_samples_to_learn", 200)),
                 min_r2=float(self.config.get("min_r2_to_learn", 0.7)),
-                ff_gain_per_feature=z.get("ff_gain_per_feature"),
                 ff_alpha=float(self.config.get("ff_alpha", 0.05)),
-                margin_c=float(self.config.get("margin_c", 5.0)),
+                fully_trained_n=int(self.config.get("fully_trained_n", 500)),
             )
-        load_models_into(MODEL_PATH, self.models)
+        load_models_into(MODEL_PATH, self.sensor_models)
 
-        # Equilibrium tracking per zone
-        self.windows: dict[str, deque[tuple[float, float, list[float]]]] = {
-            z["name"]: deque(maxlen=self.equilibrium_window_n) for z in zones
+        # Actuators: PWM channels come from fans
+        channels = [fc.pwm_channel for fc in self.fan_configs.values()]
+        self.actuators = Actuators(channels, chip_name=self.chip_name)
+
+        # Per-fan equilibrium tracking; equilibria pool is a global rolling deque
+        self.windows: dict[str, deque[tuple[float, dict[str, float], dict[str, float], dict[str, int]]]] = {
+            fn: deque(maxlen=self.equilibrium_window_n) for fn in self.fan_configs
         }
-        self.equilibria: dict[str, deque[EquilibriumSample]] = {
-            z["name"]: deque(maxlen=5000) for z in zones
-        }
+        self.equilibria: deque[EquilibriumSample] = deque(maxlen=EQUILIBRIA_MAXLEN)
         self._load_equilibria()
 
         self.last_fit_t = 0.0
-        self.last_history_day: list[str] = []  # mutable closure for rotation
+        self.last_history_day: list[str] = []
         self._stop = False
-        self._last_alarm_t: dict[str, float] = {}  # de-dup ntfy alerts
-        self._fan_fault_streak: dict[str, int] = {}
+        self._last_alarm_t: dict[str, float] = {}
+        self._fan_fault_streak: dict[str, int] = {fn: 0 for fn in self.fan_configs}
+
+        log.info(
+            "daemon initialized: %d sensors, %d fans, equilibrium_window=%.0fs",
+            len(self.sensor_configs), len(self.fan_configs), self.equilibrium_window_s,
+        )
+
+    # ---- equilibrium persistence -------------------------------------------
 
     def _load_equilibria(self) -> None:
         if not EQUILIBRIA_PATH.exists():
@@ -225,54 +416,62 @@ class Daemon:
         except OSError as exc:
             log.warning("equilibria load failed: %s", exc)
             return
-        skipped = 0
+        loaded = skipped = 0
         for line in lines:
             if not line.strip():
                 continue
             try:
                 row = json.loads(line)
-                z = row.pop("zone")
-                if z in self.equilibria:
-                    self.equilibria[z].append(EquilibriumSample(**row))
-            except (json.JSONDecodeError, KeyError, TypeError) as exc:
-                log.warning("equilibria line skipped: %s", exc)
+            except json.JSONDecodeError as exc:
+                log.warning("equilibria line skipped (json): %s", exc)
+                skipped += 1
+                continue
+            # New v2 format: has 'fan', 'features' dict, 'pwm' dict, 'temps' dict.
+            # Old v1 format: has 'zone', 'features' list, 'pwm_applied', 'T_z', 'T_amb'.
+            if "fan" not in row or "temps" not in row:
+                skipped += 1
+                continue
+            try:
+                self.equilibria.append(EquilibriumSample(
+                    t=float(row["t"]),
+                    fan=str(row["fan"]),
+                    features={str(k): float(v) for k, v in (row.get("features") or {}).items()},
+                    pwm={str(k): int(v) for k, v in (row.get("pwm") or {}).items()},
+                    temps={str(k): float(v) for k, v in (row.get("temps") or {}).items()},
+                ))
+                loaded += 1
+            except (TypeError, KeyError, ValueError) as exc:
+                log.warning("equilibria line skipped (shape): %s", exc)
                 skipped += 1
         log.info(
-            "loaded equilibria: %s (skipped %d malformed)",
-            {k: len(v) for k, v in self.equilibria.items()},
-            skipped,
+            "loaded %d equilibria samples (skipped %d — including any v1-format rows)",
+            loaded, skipped,
         )
 
-    def _append_equilibrium(self, zone_name: str, sample: EquilibriumSample) -> None:
-        self.equilibria[zone_name].append(sample)
+    def _append_equilibrium(self, sample: EquilibriumSample) -> None:
+        self.equilibria.append(sample)
         try:
             EQUILIBRIA_PATH.parent.mkdir(parents=True, exist_ok=True)
             with EQUILIBRIA_PATH.open("a") as f:
-                row = asdict(sample) | {"zone": zone_name}
-                f.write(json.dumps(row) + "\n")
+                f.write(json.dumps(asdict(sample)) + "\n")
         except OSError as exc:
             log.warning("equilibrium persist failed: %s", exc)
 
     def _persist_equilibria_atomic(self) -> None:
-        """Rewrite equilibria.jsonl from the in-memory deques (capped at
-        maxlen=5000/zone), bounding the file's growth. Called from the refit
-        block so we truncate at most once per fit_interval; per-tick appends
-        keep happening in between so a crash mid-interval doesn't lose samples.
-        """
+        """Rewrite equilibria.jsonl from the in-memory deque after each refit."""
         EQUILIBRIA_PATH.parent.mkdir(parents=True, exist_ok=True)
         tmp = EQUILIBRIA_PATH.with_suffix(EQUILIBRIA_PATH.suffix + ".tmp")
         try:
             with tmp.open("w") as f:
-                for zone_name, samples in self.equilibria.items():
-                    for s in samples:
-                        row = asdict(s) | {"zone": zone_name}
-                        f.write(json.dumps(row) + "\n")
+                for s in self.equilibria:
+                    f.write(json.dumps(asdict(s)) + "\n")
             tmp.replace(EQUILIBRIA_PATH)
         except OSError as exc:
             log.warning("equilibria atomic persist failed: %s", exc)
 
+    # ---- alarms ------------------------------------------------------------
+
     def _alarm(self, key: str, message: str, cooldown_s: float = 300.0) -> None:
-        """Emit an ntfy alert at most once per cooldown for the given key."""
         now = time.monotonic()
         if now - self._last_alarm_t.get(key, 0) < cooldown_s:
             return
@@ -280,148 +479,127 @@ class Daemon:
         log.warning("ALARM %s: %s", key, message)
         _ntfy(self.ntfy_cmd, f"[fand] {message}")
 
+    # ---- main tick ---------------------------------------------------------
+
     def _tick(self) -> None:
         obs = self.sensors.read_all()
+        features = _build_features(obs)
 
-        # ---- determine per-zone temps and check critical floor --------------
-        zone_temps: dict[str, float | None] = {}
-        zone_critical: dict[str, bool] = {}
+        # Read all sensor temperatures; apply per-sensor AR(1) feed-forward
+        # correction (only effective once that sensor's α is trained).
+        sensor_temps: dict[str, float] = {}
+        sensor_effective_temps: dict[str, float] = {}
+        for name, sc in self.sensor_configs.items():
+            T = _temp_at(obs, sc.chip, sc.label)
+            if T is None:
+                self._alarm(
+                    f"missing:{name}",
+                    f"sensor {name} ({sc.chip}/{sc.label}) unreadable",
+                )
+                continue
+            sensor_temps[name] = T
+            sensor_effective_temps[name] = self.sensor_models[name].ff_corrected_temp(T, features)
+
+        # Global critical check (per sensor)
         any_critical = False
-        for z in self.zones:
-            primary = z["target_sensors"][0]
-            T_z = _temp_at(obs, primary["chip"], primary["label"])
-            zone_temps[z["name"]] = T_z
-            critical_c = float(primary.get("critical_c", 90.0))
-            crit = T_z is not None and T_z >= critical_c
-            zone_critical[z["name"]] = crit
-            if crit:
+        for name, T_eff in sensor_effective_temps.items():
+            sc = self.sensor_configs[name]
+            if T_eff >= sc.critical_c:
                 any_critical = True
                 self._alarm(
-                    f"critical:{z['name']}",
-                    f"{z['name']} primary sensor {primary['chip']}/{primary['label']} "
-                    f"= {T_z:.1f}°C ≥ critical {critical_c:.1f}°C",
-                )
-            if T_z is None:
-                self._alarm(
-                    f"missing:{z['name']}",
-                    f"{z['name']} primary sensor {primary['chip']}/{primary['label']} unreadable",
+                    f"critical:{name}",
+                    f"sensor {name} ({sc.chip}/{sc.label}) = {T_eff:.1f}°C ≥ critical {sc.critical_c:.1f}°C",
                 )
 
-        # Also check NON-primary sensors per zone for criticals (e.g. NVMe temps
-        # might map to the same zone as the case fan; we still want to react)
-        for z in self.zones:
-            for s in z["target_sensors"][1:]:
-                T = _temp_at(obs, s["chip"], s["label"])
-                if T is None:
-                    continue
-                cc = float(s.get("critical_c", 90.0))
-                if T >= cc:
-                    any_critical = True
-                    self._alarm(
-                        f"critical:{z['name']}:{s['label']}",
-                        f"{z['name']} secondary {s['chip']}/{s['label']} "
-                        f"= {T:.1f}°C ≥ critical {cc:.1f}°C",
-                    )
+        # Per-sensor stress
+        stresses: dict[str, float] = {}
+        for name, T_eff in sensor_effective_temps.items():
+            stresses[name] = self.sensor_models[name].stress(T_eff)
 
-        # ---- decide PWMs ----------------------------------------------------
+        # Per-fan PWM decision
         applied: dict[str, int] = {}
         sources: dict[str, str] = {}
+        breakdowns: dict[str, list[tuple[str, float, float, float]]] = {}
+
         if any_critical:
             self.actuators.set_all(255)
-            applied = {z["name"]: 255 for z in self.zones}
-            sources = {z["name"]: "critical" for z in self.zones}
+            for fn in self.fan_configs:
+                applied[fn] = 255
+                sources[fn] = "critical"
+                breakdowns[fn] = []
         else:
-            T_amb = _temp_at(obs, self.chip_name, "SYSTIN") or 25.0
-            features = _build_features(obs)
-            for z in self.zones:
-                T_z = zone_temps[z["name"]]
-                if T_z is None:
-                    # Sensor missing for this zone — boost only this zone (not all)
-                    self.actuators.set_pwm(z["pwm_channel"], 255)
-                    applied[z["name"]] = 255
-                    sources[z["name"]] = "sensor_fault"
-                    continue
-                model = self.models[z["name"]]
-                pwm, source = model.predict_pwm(features, T_z, T_amb)
-                self.actuators.set_pwm(z["pwm_channel"], pwm)
-                applied[z["name"]] = pwm
-                sources[z["name"]] = source
+            for fn, fc in self.fan_configs.items():
+                demand, parts = aggregate_demand(fn, fc.cools, stresses, self.sensor_models)
+                pwm = demand_to_pwm(demand, fc.pwm_min)
+                self.actuators.set_pwm(fc.pwm_channel, pwm)
+                applied[fn] = pwm
+                any_trained_cools = any(
+                    sn in self.sensor_models and self.sensor_models[sn].is_trained()
+                    for sn in fc.cools
+                )
+                sources[fn] = "stress-learned" if any_trained_cools else "stress-seed"
+                breakdowns[fn] = parts
 
-        # ---- fan-fault detection (tach=0 while PWM≥min for sustained period)
-        for z in self.zones:
-            tach = obs.fans.get(z.get("fan_tach", "").replace("_input", ""))
+        # Fan-fault detection (per fan)
+        for fn, fc in self.fan_configs.items():
+            if not fc.fan_tach:
+                continue
+            tach_key = fc.fan_tach.removesuffix("_input")
+            tach = obs.fans.get(tach_key)
             if tach is None:
                 continue
-            if applied.get(z["name"], 0) >= z["pwm_min"] and tach < 100:
-                streak = self._fan_fault_streak.get(z["name"], 0) + 1
-                self._fan_fault_streak[z["name"]] = streak
+            if applied.get(fn, 0) >= fc.pwm_min and tach < 100:
+                streak = self._fan_fault_streak.get(fn, 0) + 1
+                self._fan_fault_streak[fn] = streak
                 if streak >= FAN_DEAD_STREAK:
                     self._alarm(
-                        f"fan_dead:{z['name']}",
-                        f"{z['name']} commanded pwm={applied[z['name']]} but tach={tach} RPM",
+                        f"fan_dead:{fn}",
+                        f"{fn} commanded pwm={applied[fn]} but tach={tach} RPM",
                     )
             else:
-                self._fan_fault_streak[z["name"]] = 0
+                self._fan_fault_streak[fn] = 0
 
-        # ---- update equilibrium windows + collect training samples ----------
-        # Per-zone `if T_z is None: continue` below already guards each zone
-        # individually; one flaky sensor must not halt learning for the others.
+        # Per-fan equilibrium collection
         if not any_critical:
-            features = _build_features(obs)
-            T_amb = _temp_at(obs, self.chip_name, "SYSTIN") or 25.0
-            for z in self.zones:
-                T_z = zone_temps[z["name"]]
-                if T_z is None:
+            feature_names = list(features.keys())
+            for fn, fc in self.fan_configs.items():
+                w = self.windows[fn]
+                w.append((obs.t, dict(sensor_temps), dict(features), dict(applied)))
+                if len(w) < self.equilibrium_window_n:
                     continue
-                w = self.windows[z["name"]]
-                w.append((obs.t, T_z, features))
-                if len(w) >= self.equilibrium_window_n and is_equilibrium(list(w)):
+                cooled = list(fc.cools.keys())
+                if is_fan_equilibrium(
+                    list(w),
+                    fan_name=fn,
+                    cooled_sensors=cooled,
+                    feature_names=feature_names,
+                    pwm_stable_s=self.equilibrium_pwm_stable_s,
+                ):
                     sample = EquilibriumSample(
                         t=obs.t,
-                        features=features,
-                        pwm_applied=applied[z["name"]],
-                        T_z=T_z,
-                        T_amb=T_amb,
+                        fan=fn,
+                        features=dict(features),
+                        pwm=dict(applied),
+                        temps=dict(sensor_temps),
                     )
-                    self._append_equilibrium(z["name"], sample)
-                    # Clear the window so we don't record N samples for one plateau
+                    self._append_equilibrium(sample)
                     w.clear()
 
-        # ---- periodic refit -------------------------------------------------
+        # Periodic refit (per-sensor)
         if obs.t - self.last_fit_t > self.fit_interval:
-            for name, model in self.models.items():
-                model.fit(list(self.equilibria[name]))
-            save_models(MODEL_PATH, self.models)
+            sample_list = list(self.equilibria)
+            fan_names = list(self.fan_configs.keys())
+            for sm in self.sensor_models.values():
+                sm.fit(sample_list, FEATURE_NAMES, fan_names)
+            save_models(MODEL_PATH, self.sensor_models)
             self._persist_equilibria_atomic()
             self.last_fit_t = obs.t
 
-        # ---- write status + history -----------------------------------------
-        status = {
-            "version": 1,
-            "wall_t": obs.wall_t,
-            "poll_interval_s": self.poll_interval,
-            "hwmon": obs.hwmon,
-            "fans": obs.fans,
-            "pwm_observed": obs.pwm,
-            "pwm_enable": obs.pwm_enable,
-            "gpu": obs.gpu,
-            "cpu_util": obs.cpu_util,
-            "ups": obs.ups,
-            "zones": [
-                {
-                    "name": z["name"],
-                    "T_z": zone_temps[z["name"]],
-                    "pwm_applied": applied.get(z["name"]),
-                    "source": sources.get(z["name"]),
-                    "trained": self.models[z["name"]].is_trained(),
-                    "n_samples": self.models[z["name"]].state.n_samples,
-                    "r2": self.models[z["name"]].state.r2,
-                }
-                for z in self.zones
-            ],
-            "errors": obs.errors,
-            "any_critical": any_critical,
-        }
+        # Status JSON v2
+        status = self._build_status(
+            obs, sensor_temps, sensor_effective_temps, stresses,
+            applied, sources, breakdowns, any_critical,
+        )
         _atomic_write_json(STATUS_PATH, status)
 
         if self.history_enabled:
@@ -434,6 +612,73 @@ class Daemon:
 
         sd_notify("WATCHDOG=1")
 
+    def _build_status(
+        self,
+        obs: Observation,
+        sensor_temps: dict[str, float],
+        sensor_effective_temps: dict[str, float],
+        stresses: dict[str, float],
+        applied: dict[str, int],
+        sources: dict[str, str],
+        breakdowns: dict[str, list[tuple[str, float, float, float]]],
+        any_critical: bool,
+    ) -> dict[str, Any]:
+        sensors_state = []
+        for name, sc in self.sensor_configs.items():
+            sm = self.sensor_models[name]
+            sensors_state.append({
+                "name": name,
+                "chip": sc.chip,
+                "label": sc.label,
+                "T": sensor_temps.get(name),
+                "T_eff": sensor_effective_temps.get(name),
+                "target_c": sc.target_c,
+                "critical_c": sc.critical_c,
+                "stress": stresses.get(name),
+                "trained": sm.is_trained(),
+                "n_samples": sm.state.n_samples,
+                "r2": sm.state.r2,
+            })
+
+        fans_state = []
+        for fn, fc in self.fan_configs.items():
+            rpm = None
+            if fc.fan_tach:
+                tach_key = fc.fan_tach.removesuffix("_input")
+                rpm = obs.fans.get(tach_key)
+            parts = breakdowns.get(fn, [])
+            driving = [
+                {"sensor": s, "stress": round(st, 3), "relevance": round(r, 3), "contribution": round(c, 3)}
+                for s, st, r, c in parts[:3]
+            ]
+            fans_state.append({
+                "name": fn,
+                "pwm_channel": fc.pwm_channel,
+                "pwm_applied": applied.get(fn),
+                "rpm": rpm,
+                "source": sources.get(fn),
+                "driving_sensors": driving,
+            })
+
+        return {
+            "version": 2,
+            "wall_t": obs.wall_t,
+            "poll_interval_s": self.poll_interval,
+            "hwmon": obs.hwmon,
+            "fans": obs.fans,
+            "pwm_observed": obs.pwm,
+            "pwm_enable": obs.pwm_enable,
+            "gpu": obs.gpu,
+            "cpu_util": obs.cpu_util,
+            "ups": obs.ups,
+            "sensors": sensors_state,
+            "fans_state": fans_state,
+            "errors": obs.errors,
+            "any_critical": any_critical,
+        }
+
+    # ---- main loop ---------------------------------------------------------
+
     def _handle_signal(self, signum: int, _frame: Any) -> None:
         log.info("signal %d received, exiting cleanly", signum)
         self._stop = True
@@ -444,15 +689,20 @@ class Daemon:
 
         with self.actuators:
             sd_notify("READY=1")
-            sd_notify(f"STATUS=running, {len(self.zones)} zones")
-            log.info("daemon entering main loop, poll_interval=%.1fs", self.poll_interval)
+            sd_notify(
+                f"STATUS=running, {len(self.sensor_configs)} sensors, "
+                f"{len(self.fan_configs)} fans"
+            )
+            log.info(
+                "daemon entering main loop, poll_interval=%.1fs",
+                self.poll_interval,
+            )
             next_tick = time.monotonic()
             while not self._stop:
                 try:
                     self._tick()
                 except Exception:
                     log.exception("tick failed")
-                    # Don't bail on transient errors — safety floor is the daemon's job.
                 next_tick += self.poll_interval
                 sleep_for = max(0.0, next_tick - time.monotonic())
                 if sleep_for == 0.0:
@@ -484,9 +734,6 @@ def main(argv: list[str] | None = None) -> int:
     _setup_logging()
 
     if args.restore_bios:
-        # Read chip_name from config so restore targets the right chip on
-        # non-nct6799 hosts. Restore must never block on parse errors — fall
-        # back to the default and try anyway.
         chip_name = "nct6799"
         try:
             cfg = yaml.safe_load(Path(args.config).read_text()) or {}

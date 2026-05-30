@@ -1,15 +1,22 @@
 # fand
 
-Adaptive system fan controller for Linux. Polls hwmon, `nvidia-smi`,
-`/proc/stat`, and a NUT UPS at 2 s; drives Super-I/O PWM channels via a
-per-zone ridge-regression model on equilibrium samples plus AR(1) predictive
-feed-forward — fans lead heat surges from GPU/CPU/UPS load instead of chasing
-them.
+Autonomous multi-fan multi-sensor thermal controller for Linux. Polls hwmon,
+`nvidia-smi`, `/proc/stat`, and a NUT UPS at 2 s; drives Super-I/O PWM
+channels via a *learned* per-sensor cooling-coefficient matrix and a
+stress-based control law — every fan responds to whichever sensors it can
+meaningfully affect, weighted by how strongly. AR(1) predictive feed-forward
+anticipates heat surges from load before temps rise.
+
+Designed for systems where the operator doesn't know which fan cools what
+and would rather have the daemon figure it out from runtime data than
+hand-tune curves per sensor. **See [DESIGN.md](DESIGN.md) for the project
+goal, why per-zone control was the wrong abstraction, and the control law
+in detail.**
 
 Runs as a root `systemd` service. Snapshots BIOS PWM modes on startup and
 restores on shutdown. Unconditional safety floors are independent of the
-learned model: critical temp → all fans to 255, sensor fault → that zone to
-255, dead-fan detection on commanded PWM ≥ pwm_min with zero tach.
+learned model: any sensor at/above its `critical_c` → all fans to 255 + alarm,
+dead-fan detection on commanded PWM ≥ pwm_min with zero tach.
 
 ## Requirements
 
@@ -50,31 +57,39 @@ daemon runs from. To pick up source changes, re-run `sudo install.sh`.
 ## Bring up
 
 ```bash
-sudo fand-calibrate                 # ~5 min, system MUST be idle
-sudo $EDITOR /etc/fand/zones.yaml   # set target_sensors per zone
+sudo fand-calibrate                 # ~15 min total
+sudo $EDITOR /etc/fand/zones.yaml   # review sensor target_c/critical_c
 sudo systemctl start fand
 fand-ctl status
 journalctl -u fand -f
 ```
 
-`fand-calibrate` does a PWM perturbation sweep — it spins each managed fan
-up and down individually to discover which PWM drives which tach and the
-minimum PWM at which each fan reliably spins, then writes a template
-`zones.yaml` with one zone per (PWM, responding fan) pair. You fill in
-`target_sensors` (which temps each zone should hold under control) by hand,
-based on physical case layout — no probe can tell us "this is the front
-intake vs the rear exhaust."
+`fand-calibrate` runs three phases:
 
-Run with the system fully idle (stop ML training, encoding, etc.) and be
-at the desk to hear what's ramping. The sweep takes about 5 minutes.
+1. **PWM ↔ fan-tach mapping** (idle system): bounces each PWM channel and
+   records which tach responds the most.
+2. **`pwm_min` discovery** (idle system): walks each fan down to find its
+   minimum spinning PWM.
+3. **Sensor attribution** (system under typical load): drops each fan one
+   at a time, measures ΔT per sensor, writes the per-fan `cools:` dict
+   with seed cooling weights (in °C of ΔT).
+
+Phases 1 and 2 want the system idle so probes aren't masked by load-driven
+heat. Phase 3 *needs* heat to register — start a typical workload before
+running. The whole thing takes about 15 minutes.
+
+The output `/etc/fand/zones.yaml` is ready to use; the operator should
+review the sensor `target_c`/`critical_c` defaults (which are conservative
+based on hardware specs) and possibly trim the sensor catalog before
+starting the service.
 
 ## Operating
 
 | Command | Purpose |
 |---|---|
-| `fand-ctl status` | Live zone temps, applied PWMs, model state |
+| `fand-ctl status` | Per-sensor stress + per-fan PWM with driving-sensor breakdown |
 | `fand-ctl tail -n 50` | Recent poll history from `history.jsonl` |
-| `fand-ctl model` | Learned ridge-regression coefficients per zone |
+| `fand-ctl model` | Learned per-sensor coefs + cooling-coefficient matrix |
 | `sudo systemctl {start,stop,restart} fand` | Service control |
 | `journalctl -u fand -f` | Live daemon logs |
 
@@ -85,21 +100,37 @@ at the desk to hear what's ramping. The sweep takes about 5 minutes.
 
 Every 2 s the daemon:
 
-- Reads all sensors. For each zone, checks its primary target sensor against
-  `critical_c` — if exceeded, drives **all** fans to 255 and emits an alarm.
-- Otherwise predicts PWM from `(features, T_zone, T_ambient)` using the
-  learned ridge regression, or the operator's bootstrap curve until ≥ 200
-  equilibrium samples and R² ≥ 0.7 are reached.
-- Detects equilibrium (low dT/dt + low feature variance over a 30 s window)
-  and persists the sample to `equilibria.jsonl` for the next refit.
-- Refits each zone hourly (`fit_interval_s`).
-- Adds an AR(1) surge bump from the EMA of the feature vector, so fan speed
-  ramps *before* temps rise on a GPU/CPU/UPS load step.
+1. Reads every declared sensor. Applies per-sensor AR(1) feed-forward
+   correction (predicts near-term ΔT from feature deltas using learned α
+   coefs — disabled per-sensor while untrained).
+2. Computes `stress(s) = max(0, (T - target_c) / (critical_c - target_c))`
+   per sensor.
+3. If any sensor is at or above its `critical_c`, drives all fans to 255
+   and emits an alarm keyed by sensor name. Bypasses the rest of the loop.
+4. Otherwise, per fan:
+   ```
+   relevance(s, p) = γ_p(s) / max_q γ_q(s)
+   demand(p)      = min(1, Σ_s stress(s)^1.5 × relevance(s, p))
+   PWM(p)         = pwm_min + demand × (255 − pwm_min)
+   ```
+   Until γ is trained, the daemon uses normalized seed weights from each
+   fan's `cools:` dict (phase 3 ΔT values).
+5. Detects per-fan equilibrium (fan's PWM stable + its cooled sensors at
+   low dT/dt + load features stable) and appends a sample to
+   `equilibria.jsonl` for the next refit.
+6. Refits per-sensor coefs hourly (`fit_interval_s`), regularizing γ
+   toward seed weights for low-sample-count fits and clipping γ ≥ 0
+   post-solve.
+
+See [DESIGN.md](DESIGN.md) for the matrix evolution timeline (t=0 declared
+cools → t=1h initial fit → t>1d mature γ) and the configuration-vs-learned
+state split.
 
 Persistent state survives restarts:
 
-- `/var/lib/fand/model.json` — learned ridge coefficients per zone
-- `/var/lib/fand/equilibria.jsonl` — equilibrium training pool
+- `/var/lib/fand/model.json` — per-sensor `baseline`, `load_coefs` (α),
+  `cooling_coefs` (γ), `r²`, `n_samples`
+- `/var/lib/fand/equilibria.jsonl` — equilibrium training pool, per-fan rows
 - `/var/lib/fand/saved_pwm.json` — original PWM modes captured at startup
 - `/var/lib/fand/history.jsonl` — per-poll observation log (gzip-rotated
   daily, 30-day retention)
@@ -109,14 +140,41 @@ Persistent state survives restarts:
 `/etc/fand/config.yaml` — daemon tunables. The full annotated list is in
 [`etc/config.yaml.example`](etc/config.yaml.example). Most-edited fields:
 `chip_name`, `poll_interval_s`, `fit_interval_s`, `ridge_lambda`,
-`min_samples_to_learn`, `min_r2_to_learn`, `margin_c`, `ff_alpha`,
-`ups_name`, `ntfy_command`.
+`min_samples_to_learn`, `min_r2_to_learn`, `equilibrium_pwm_stable_s`,
+`ff_alpha`, `ups_name`, `ntfy_command`.
 
-`/etc/fand/zones.yaml` — per-zone definitions. Generated by `fand-calibrate`,
-then operator-edited. Each zone has `name`, `pwm_channel`, `fan_tach`,
-`pwm_min`, a list of `target_sensors` (`{chip, label, target_c, critical_c}`),
-and a `bootstrap_curve` used before the learned model passes its hysteresis
-gates.
+`/etc/fand/zones.yaml` — sensors + fans. Generated by `fand-calibrate`, then
+operator-reviewed. Schema:
+
+```yaml
+defaults:
+  pwm_min: 40
+
+sensors:
+  cpu_die:      { chip: k10temp,     label: Tctl,    target_c: 70, critical_c: 90 }
+  case_ambient: { chip: nct6799,     label: AUXTIN0, target_c: 45, critical_c: 65 }
+  nvidia_gpu:   { chip: gpu,         label: temp_c,  target_c: 80, critical_c: 90 }
+  # ...
+
+fans:
+  pwm1:
+    fan_tach: fan1_input
+    cools: { case_ambient: 3.0, nvidia_gpu: 0.6 }    # ΔT °C from phase 3
+  pwm4:
+    fan_tach: fan4_input
+    pwm_min: 50          # optional override
+    cools: { cpu_die: 2.8, nvidia_gpu: 0.3 }
+```
+
+Multi-instance chips like NVMe and DDR5 SPD need explicit indexing:
+`chip: "nvme[0]"`, `chip: "spd5118[1]"`. The daemon does not fuzzy-match
+across instances.
+
+If you upgrade from an older fand install with the per-zone schema, the
+daemon detects it at startup, writes a translated v2 file to
+`/etc/fand/zones.yaml.translated`, and exits with a `sudo mv` prompt.
+After the move, re-run `sudo fand-calibrate` to replace the translator's
+uniform seed weights with phase-3-measured ΔT values.
 
 ## Uninstall
 

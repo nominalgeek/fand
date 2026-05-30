@@ -1,13 +1,14 @@
 """fand-calibrate: PWM perturbation sweep + zones.yaml generation.
 
-Three-phase, operator-supervised. The output is a zones.yaml with
-target_sensors filled in from empirical attribution — operator can still
-review and tweak, but it lands ready to use.
+Three-phase, operator-supervised. The output is a zones.yaml in the new
+sensors+fans schema with phase-3-measured cooling weights baked into each
+fan's `cools:` dict — review and tune target_c/critical_c, but it lands
+ready to use.
 
   1. PWM ↔ fan-tach mapping (which physical fan responds to each PWM channel)
   2. pwm_min per channel (lowest PWM at which the fan still spins)
   3. Sensor attribution (which sensors warm up when each fan is throttled —
-     identifies what each fan is actually cooling without operator input)
+     produces the seed cooling weights that bootstrap the daemon's control law)
 
 Run with:  fand-calibrate     (after `sudo install.sh`)
 Requires root (writes to /sys/class/hwmon).
@@ -33,15 +34,12 @@ from .sensors import Sensors, find_hwmon_by_name
 log = logging.getLogger("fand-calibrate")
 
 
-DEFAULT_BOOTSTRAP_CURVE = [(40.0, 100), (60.0, 160), (75.0, 210), (85.0, 255)]
-
 # Phase 3 (attribution) defaults
 ATTRIBUTION_BASELINE_PWM = 200
 ATTRIBUTION_BASELINE_SETTLE_S = 60.0
 ATTRIBUTION_DROP_DURATION_S = 90.0
 ATTRIBUTION_RECOVERY_S = 30.0
 ATTRIBUTION_MIN_DELTA_C = 0.5
-ATTRIBUTION_TOP_N = 2
 ATTRIBUTION_SAMPLES = 5
 ATTRIBUTION_SAMPLE_INTERVAL_S = 2.0
 
@@ -59,11 +57,7 @@ def _settle(seconds: float) -> None:
 
 
 def _check_no_daemon_running() -> None:
-    """Refuse to run if fand.service is active. The daemon writes PWM values
-    every poll interval; if it's running during calibration it overwrites
-    every probe and produces garbage data (phase 1 deltas collapse to noise,
-    phase 3 sees no temp delta because the daemon counter-acts the drop).
-    """
+    """Refuse to run if fand.service is active — would fight every PWM write."""
     try:
         result = subprocess.run(
             ["systemctl", "is-active", "--quiet", "fand.service"],
@@ -71,15 +65,48 @@ def _check_no_daemon_running() -> None:
             timeout=5,
         )
     except (subprocess.SubprocessError, FileNotFoundError):
-        # systemctl unavailable — can't check, proceed and hope.
         return
     if result.returncode == 0:
         log.error("fand.service is currently active and will fight every PWM write.")
-        log.error("Stop the daemon first, run this, then start it again with the new zones:")
+        log.error("Stop the daemon first, run this, then start it again:")
         log.error("    sudo systemctl stop fand")
         log.error("    sudo fand-calibrate")
         log.error("    sudo systemctl start fand")
         sys.exit(3)
+
+
+def _sensor_name(chip: str, label: str) -> str:
+    """Slug for sensor key. nvme[0]/Composite → nvme0_composite."""
+    out: list[str] = []
+    prev_under = False
+    for c in f"{chip}_{label}":
+        if c.isalnum():
+            out.append(c.lower())
+            prev_under = False
+        elif not prev_under:
+            out.append("_")
+            prev_under = True
+    return "".join(out).strip("_") or "sensor"
+
+
+def _collect_sensors_catalog(s: Sensors) -> dict[str, tuple[str, str]]:
+    """All currently-readable sensors that have valid (non-zero, non-bogus)
+    temperature readings. The Sensors layer already filters readings outside
+    [-50, 150] °C; we additionally skip exactly-0.0 readings which are typical
+    of unwired PCH chip thermistors that some boards expose.
+
+    Returns: {sensor_name → (chip, label)}.
+    """
+    obs = s.read_all()
+    catalog: dict[str, tuple[str, str]] = {}
+    for chip, temps in obs.hwmon.items():
+        for label, val in temps.items():
+            if val == 0.0:
+                continue
+            catalog[_sensor_name(chip, label)] = (chip, label)
+    if obs.gpu and "temp_c" in obs.gpu:
+        catalog[_sensor_name("gpu", "temp_c")] = ("gpu", "temp_c")
+    return catalog
 
 
 def _average_temps(
@@ -87,10 +114,8 @@ def _average_temps(
     samples: int = ATTRIBUTION_SAMPLES,
     interval: float = ATTRIBUTION_SAMPLE_INTERVAL_S,
 ) -> dict[tuple[str, str], float]:
-    """Sample temps multiple times via Sensors.read_all(), return mean per
-    (chip, label). Includes hwmon temps and (if available) the NVIDIA GPU
-    temp from nvidia-smi (under the special chip key 'gpu').
-    """
+    """Mean temperature per (chip, label) across `samples` polls. Includes GPU
+    via nvidia-smi (special chip key 'gpu')."""
     sums: dict[tuple[str, str], list[float]] = {}
     for i in range(samples):
         obs = sensors_obj.read_all()
@@ -105,58 +130,57 @@ def _average_temps(
 
 
 def _sensor_defaults(chip: str, label: str) -> tuple[float, float]:
-    """Return (target_c, critical_c) for a given chip/label. Defaults are
-    conservative — operator should review for their specific hardware.
-    """
-    # AMD CPU die (k10temp/Tctl). Ryzen throttles around 95°C.
+    """Conservative (target_c, critical_c) per hardware class. Operator can
+    tune per machine in zones.yaml."""
+    # AMD CPU die (Ryzen throttles ~95°C)
     if chip == "k10temp":
-        return (75.0, 90.0)
-    # Super-I/O sensors that reflect the CPU (TSI0_TEMP mirrors Tctl;
-    # CPUTIN is the nct socket thermistor which lags).
+        return (70.0, 90.0)
+    # nct sensors mirroring CPU diode or board socket
     if chip.startswith("nct") and label in ("TSI0_TEMP", "CPUTIN"):
-        return (75.0, 90.0)
-    # NVIDIA GPU via nvidia-smi (Blackwell throttles ~87-95°C).
+        return (70.0, 90.0)
+    # NVIDIA GPU via nvidia-smi (Blackwell throttles ~87°C)
     if chip == "gpu":
-        return (75.0, 90.0)
+        return (80.0, 90.0)
     # AMD GPU / iGPU
     if chip == "amdgpu":
         return (75.0, 90.0)
-    # DDR5 SPD5118 — module HIGH alarm fires at 55°C; give 5°C margin.
-    if chip == "spd5118":
-        return (50.0, 55.0)
-    # NVMe — most drives start throttling around 70-80°C.
+    # DDR5 SPD5118 — JEDEC HIGH alarm at 55°C
+    if chip.startswith("spd5118"):
+        return (45.0, 55.0)
+    # NVMe drives — Sensor 2 (NAND) runs hotter than Composite/controller
     if chip == "nvme" or chip.startswith("nvme["):
-        return (65.0, 80.0)
-    # nct ambient probes (SYSTIN, AUXTIN*). Chassis interior under load.
+        if label == "Sensor 2":
+            return (65.0, 80.0)
+        return (60.0, 75.0)
+    # nct ambient probes
     if chip.startswith("nct"):
-        return (50.0, 70.0)
-    # Unknown — be conservative.
+        if label == "AUXTIN4":  # external room-ambient probe
+            return (30.0, 45.0)
+        if label == "SMBUSMASTER 0":
+            return (65.0, 80.0)
+        return (45.0, 65.0)
     return (60.0, 80.0)
 
 
 def map_pwm_to_tach(actuators: Actuators, hw: Path, fan_keys: list[str]) -> dict[str, str | None]:
     """For each PWM channel, find which fan tach responds the most.
 
-    Strategy: set every other PWM to 160 (steady), then for the channel under
-    test bounce 80 → 220 → 80 and record the tach with the biggest swing.
-    Returns {pwm_channel: fan_key_or_None}.
+    Strategy: hold every other PWM at 160; bounce target 80 → 220 → 80;
+    record tach with biggest swing. Returns {pwm_channel: fan_key_or_None}.
     """
     mapping: dict[str, str | None] = {}
     channels = list(actuators.handles.keys())
 
     for target in channels:
         log.info("probing %s …", target)
-        # Hold every other channel at 160 (60%) so they don't drift during probe
         for ch in channels:
             actuators.set_pwm(ch, 160)
         _settle(3.0)
 
-        # Low step
         actuators.set_pwm(target, 80)
         _settle(4.0)
         low = {k: _read_tach(hw, k) for k in fan_keys}
 
-        # High step
         actuators.set_pwm(target, 220)
         _settle(4.0)
         high = {k: _read_tach(hw, k) for k in fan_keys}
@@ -165,26 +189,21 @@ def map_pwm_to_tach(actuators: Actuators, hw: Path, fan_keys: list[str]) -> dict
         log.info("  deltas: %s", deltas)
 
         best = max(deltas.items(), key=lambda kv: kv[1])
-        if best[1] < 100:  # tiny swing -> probably not connected
+        if best[1] < 100:
             log.info("  -> %s: no fan responded (deltas all small)", target)
             mapping[target] = None
         else:
             mapping[target] = best[0]
             log.info("  -> %s drives %s (Δ %d RPM)", target, best[0], best[1])
 
-        # Return to neutral
         actuators.set_pwm(target, 160)
 
     return mapping
 
 
 def find_pwm_min(actuators: Actuators, hw: Path, channel: str, tach: str | None) -> int:
-    """Step PWM down until the fan stalls (or we hit a safety floor).
-
-    Returns the lowest PWM at which the fan still reports ≥200 RPM, plus a
-    small safety margin. If no tach is owned by this channel, returns 80 as a
-    conservative default.
-    """
+    """Step PWM down until the fan stalls. Returns the lowest spinning PWM
+    plus a small safety margin, or 200 if the fan never spun."""
     if not tach:
         return 80
 
@@ -201,17 +220,12 @@ def find_pwm_min(actuators: Actuators, hw: Path, channel: str, tach: str | None)
             break
         last_spinning = v
     if last_spinning is None:
-        # Fan never spun in the probe range — could be a high-static-pressure
-        # server fan, large 140/200mm, or AIO pump whose real min is >100,
-        # or the fan is dead. Return safe-high so runtime doesn't try to
-        # under-drive it; operator must review pwm_min in zones.yaml.
         log.warning(
             "%s: fan never spun in probe range (100..20) — returning safe-high "
             "default 200; review pwm_min in zones.yaml",
             channel,
         )
         return 200
-    # Margin: +20 PWM over the last spinning value, capped at 100
     return min(100, last_spinning + 20)
 
 
@@ -220,22 +234,17 @@ def attribute_fans(
     sensors_obj: Sensors,
     pwm_to_tach: dict[str, str | None],
     pwm_min: dict[str, int],
-) -> dict[str, list[tuple[str, str, float]]]:
-    """Phase 3: empirically attribute each managed fan to the sensors it cools.
+) -> dict[str, dict[str, float]]:
+    """Phase 3: empirical sensor attribution.
 
-    Holds all managed fans at a high baseline, then walks each one in turn:
-    drops it to its pwm_min for the observation window, records ΔT per sensor
-    vs the steady-state baseline, ranks sensors by ΔT, and keeps the top-N
-    above the noise threshold. Restores the channel and lets the system
-    recover before moving to the next.
-
-    Returns: {pwm_channel: [(chip, label, delta_c), ...]}, sorted by delta_c
-    desc. Channels with no responding fan, or with no sensor crossing
-    ATTRIBUTION_MIN_DELTA_C, get an empty list (caller falls back to a TODO
-    placeholder).
+    Holds all managed fans at a high baseline, then walks each one: drops to
+    pwm_min for the observation window, measures ΔT per sensor against the
+    pre-drop steady state, retains sensors with Δ ≥ noise threshold. Returns
+    {fan_name → {sensor_name → ΔT_c}}. These ΔT values become the seed cooling
+    weights the daemon uses until it learns runtime coefficients.
     """
     managed = [ch for ch, tach in pwm_to_tach.items() if tach]
-    attribution: dict[str, list[tuple[str, str, float]]] = {ch: [] for ch in pwm_to_tach}
+    attribution: dict[str, dict[str, float]] = {ch: {} for ch in pwm_to_tach}
     if not managed:
         return attribution
 
@@ -261,27 +270,26 @@ def attribute_fans(
         _settle(ATTRIBUTION_DROP_DURATION_S)
 
         post = _average_temps(sensors_obj)
-        deltas: list[tuple[str, str, float]] = []
+        hits: list[tuple[str, str, float]] = []  # (chip, label, delta)
         for key, post_val in post.items():
             base_val = baseline.get(key)
             if base_val is None:
                 continue
             d = post_val - base_val
             if d >= ATTRIBUTION_MIN_DELTA_C:
-                deltas.append((key[0], key[1], d))
-        deltas.sort(key=lambda x: -x[2])
-        top = deltas[:ATTRIBUTION_TOP_N]
-        if top:
-            summary = ", ".join(f"{c}/{lbl} (Δ{d:+.1f}°C)" for c, lbl, d in top)
-            log.info("  -> %s attributed to: %s", target, summary)
+                hits.append((key[0], key[1], d))
+        hits.sort(key=lambda x: -x[2])
+        if hits:
+            summary = ", ".join(f"{c}/{lbl} (Δ{d:+.1f}°C)" for c, lbl, d in hits[:3])
+            log.info("  -> %s cools: %s", target, summary)
         else:
             log.info(
-                "  -> %s: no sensor showed Δ ≥ %.1f°C (will mark as TODO)",
+                "  -> %s: no sensor showed Δ ≥ %.1f°C (cools: will be empty)",
                 target, ATTRIBUTION_MIN_DELTA_C,
             )
-        attribution[target] = top
+        for c, lbl, d in hits:
+            attribution[target][_sensor_name(c, lbl)] = round(d, 2)
 
-        # Restore + recover before next channel
         actuators.set_pwm(target, ATTRIBUTION_BASELINE_PWM)
         log.info("  recovering %.0fs", ATTRIBUTION_RECOVERY_S)
         _settle(ATTRIBUTION_RECOVERY_S)
@@ -289,56 +297,79 @@ def attribute_fans(
     return attribution
 
 
+def _yaml_quote(s: str) -> str:
+    """Quote a YAML scalar if it contains characters that would confuse the
+    parser (brackets for chip indices, spaces, etc.). Otherwise pass through."""
+    if any(c in s for c in "[]:#&*!|>'\"%@`,? "):
+        # Single-quote string; escape single quotes by doubling
+        return "'" + s.replace("'", "''") + "'"
+    return s
+
+
 def render_zones_yaml(
     pwm_to_tach: dict[str, str | None],
     pwm_min: dict[str, int],
-    attribution: dict[str, list[tuple[str, str, float]]],
+    attribution: dict[str, dict[str, float]],
+    sensors_catalog: dict[str, tuple[str, str]],
     out_path: Path,
 ) -> None:
-    """Write zones.yaml using phase 3 attribution results. Channels with no
-    attributed sensors fall back to a SYSTIN placeholder with a TODO comment.
+    """Write zones.yaml in v2 (sensors + fans) schema. Backs up an existing
+    file to .bak.
     """
+    pwm_min_default = min(pwm_min.values()) if pwm_min else 40
     lines: list[str] = []
+
+    # ---- header ----
     lines.append("# Generated by fand-calibrate on " + time.strftime("%Y-%m-%dT%H:%M:%S"))
-    lines.append("# target_sensors auto-filled from phase 3 attribution (top-N by ΔT")
-    lines.append("# during PWM drop). Review the temps and adjust target_c/critical_c")
-    lines.append("# for your hardware tolerances.")
-    lines.append("# - chip: hwmon `name` file (e.g. nct6799, k10temp, nvme, spd5118).")
-    lines.append("# - label: sensor label (e.g. Tctl, SYSTIN, Composite, temp1).")
-    lines.append("# - target_c: temp we want this fan to hold below.")
-    lines.append("# - critical_c: hard floor; if exceeded, all fans -> 255 + alert.")
-    lines.append("zones:")
+    lines.append("#")
+    lines.append("# defaults: applied to fans that don't override.")
+    lines.append("#")
+    lines.append("# sensors:  every readable temperature on this host worth tracking.")
+    lines.append("#           target_c / critical_c are conservative defaults based on")
+    lines.append("#           hardware specs — review and tune for your system.")
+    lines.append("#")
+    lines.append("# fans:     PWM channels that responded to a fan tach. The cools dict")
+    lines.append("#           maps sensor name to phase-3 ΔT (°C) — the seed cooling weight")
+    lines.append("#           used until the daemon has learned runtime coefficients.")
+    lines.append("#           Add sensors to a fan's cools list if you know it should")
+    lines.append("#           affect them but phase 3 missed it (e.g. not enough thermal")
+    lines.append("#           load on that sensor during calibration).")
+    lines.append("")
+    lines.append("defaults:")
+    lines.append(f"  pwm_min: {pwm_min_default}")
+
+    # ---- sensors ----
+    lines.append("")
+    lines.append("sensors:")
+    sorted_sensors = sorted(sensors_catalog.items(), key=lambda kv: (kv[1][0], kv[1][1]))
+    for name, (chip, label) in sorted_sensors:
+        target_c, critical_c = _sensor_defaults(chip, label)
+        lines.append(f"  {name}:")
+        lines.append(f"    chip: {_yaml_quote(chip)}")
+        lines.append(f"    label: {_yaml_quote(label)}")
+        lines.append(f"    target_c: {target_c}")
+        lines.append(f"    critical_c: {critical_c}")
+
+    # ---- fans ----
+    lines.append("")
+    lines.append("fans:")
     for pwm_ch, tach in pwm_to_tach.items():
         if tach is None:
             lines.append(f"  # {pwm_ch}: no responding fan detected; not managed")
             continue
-        lines.append(f"  - name: {pwm_ch}")
-        lines.append(f"    pwm_channel: {pwm_ch}")
+        lines.append(f"  {pwm_ch}:")
         lines.append(f"    fan_tach: {tach}_input")
-        lines.append(f"    pwm_min: {pwm_min.get(pwm_ch, 80)}")
-        attr = attribution.get(pwm_ch, [])
+        if pwm_min.get(pwm_ch, pwm_min_default) != pwm_min_default:
+            lines.append(f"    pwm_min: {pwm_min[pwm_ch]}")
+        attr = attribution.get(pwm_ch, {})
         if attr:
-            lines.append(f"    target_sensors:")
-            for i, (chip, label, delta) in enumerate(attr):
-                role = "primary" if i == 0 else "secondary critical"
-                target_c, critical_c = _sensor_defaults(chip, label)
-                lines.append(f"      # {role} (Δ{delta:+.1f}°C during phase 3)")
-                lines.append(f"      - chip: {chip}")
-                lines.append(f"        label: {label}")
-                lines.append(f"        target_c: {target_c}")
-                lines.append(f"        critical_c: {critical_c}")
+            lines.append(f"    cools:")
+            for sn, delta in sorted(attr.items(), key=lambda kv: -kv[1]):
+                lines.append(f"      {sn}: {delta:.2f}    # ΔT °C during phase 3")
         else:
-            lines.append(f"    # TODO: phase 3 found no sensor with Δ ≥ {ATTRIBUTION_MIN_DELTA_C}°C")
-            lines.append(f"    # — set target_sensors by hand (check `sensors` for options)")
-            lines.append(f"    target_sensors:")
-            lines.append(f"      - chip: nct6799")
-            lines.append(f"        label: SYSTIN")
-            lines.append(f"        target_c: 65.0")
-            lines.append(f"        critical_c: 80.0")
-        lines.append(f"    bootstrap_curve:  # temp_c -> pwm fallback before learning")
-        for t, p in DEFAULT_BOOTSTRAP_CURVE:
-            lines.append(f"      - [{t}, {p}]")
-        lines.append("")
+            lines.append(f"    # TODO: phase 3 saw no sensor move ≥ {ATTRIBUTION_MIN_DELTA_C}°C for this fan.")
+            lines.append(f"    # Add sensor names (with seed weights in °C) you know it cools:")
+            lines.append(f"    cools: {{}}")
 
     text = "\n".join(lines) + "\n"
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -357,7 +388,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument(
         "--skip-attribution",
         action="store_true",
-        help="skip phase 3 (empirical sensor attribution); write TODO placeholders",
+        help="skip phase 3 (empirical sensor attribution); write empty cools dicts",
     )
     args = ap.parse_args(argv)
 
@@ -377,8 +408,6 @@ def main(argv: list[str] | None = None) -> int:
         log.error("hwmon chip %s not found", args.chip)
         return 2
 
-    # Pre-flight: warn about GPU state. Phases 1+2 want idle for clean delta-RPM
-    # measurements; phase 3 wants load running for delta-T signal — flag both.
     s = Sensors(chip_name=args.chip)
     obs = s.read_all()
     if obs.gpu and obs.gpu["util_pct"] > 5 and args.skip_attribution:
@@ -393,18 +422,20 @@ def main(argv: list[str] | None = None) -> int:
         )
     if not args.skip_attribution and (not obs.gpu or obs.gpu["util_pct"] < 5):
         log.warning(
-            "no GPU load detected — phase 3 attribution needs heat to produce "
-            "signal; consider starting a typical workload before continuing"
+            "no GPU load detected — phase 3 needs heat to produce signal; "
+            "consider starting a typical workload before continuing"
         )
 
-    # Find all pwm channels on this chip
+    sensors_catalog = _collect_sensors_catalog(s)
+
     channels: list[str] = []
     for p in sorted(hw.glob("pwm*")):
         if "_" in p.name:
-            continue  # skip pwm1_enable etc.
+            continue
         channels.append(p.name)
     fan_keys = [p.name.removesuffix("_input") for p in sorted(hw.glob("fan*_input"))]
     log.info("chip %s — pwm channels: %s, fan tachs: %s", args.chip, channels, fan_keys)
+    log.info("sensors catalog: %d entries", len(sensors_catalog))
 
     log.info("starting calibration. Press Ctrl-C to abort (restores BIOS mode).")
     with Actuators(channels, chip_name=args.chip) as actuators:
@@ -416,22 +447,36 @@ def main(argv: list[str] | None = None) -> int:
         for ch in channels:
             log.info("finding pwm_min for %s ...", ch)
             pwm_min[ch] = find_pwm_min(actuators, hw, ch, pwm_to_tach.get(ch))
-            # Restore to neutral before next channel
             actuators.set_pwm(ch, 160)
 
         if args.skip_attribution:
-            log.info("phase 3 skipped (--skip-attribution); zones.yaml will have TODO placeholders")
-            attribution: dict[str, list[tuple[str, str, float]]] = {ch: [] for ch in pwm_to_tach}
+            log.info("phase 3 skipped (--skip-attribution); fans will have empty cools dicts")
+            attribution: dict[str, dict[str, float]] = {ch: {} for ch in pwm_to_tach}
         else:
             attribution = attribute_fans(actuators, s, pwm_to_tach, pwm_min)
 
-    # We're back in BIOS mode after the context exit. Write the template.
-    render_zones_yaml(pwm_to_tach, pwm_min, attribution, Path(args.out))
+    # Auto-add any attributed sensor that wasn't in the pre-cal catalog (e.g.
+    # a sensor that only became readable under load).
+    obs_post = s.read_all()
+    for fan_attr in attribution.values():
+        for sensor_name in fan_attr:
+            if sensor_name in sensors_catalog:
+                continue
+            for chip, temps in obs_post.hwmon.items():
+                for label in temps:
+                    if _sensor_name(chip, label) == sensor_name:
+                        sensors_catalog[sensor_name] = (chip, label)
+                        break
+            if sensor_name not in sensors_catalog and obs_post.gpu:
+                if _sensor_name("gpu", "temp_c") == sensor_name:
+                    sensors_catalog[sensor_name] = ("gpu", "temp_c")
+
+    render_zones_yaml(pwm_to_tach, pwm_min, attribution, sensors_catalog, Path(args.out))
 
     log.info("done.")
     log.info("next steps:")
-    log.info("  1. review %s -- check target_c/critical_c per zone", args.out)
-    log.info("  2. systemctl start fand")
+    log.info("  1. review %s — check sensor target_c/critical_c and fan cools lists", args.out)
+    log.info("  2. sudo systemctl start fand")
     log.info("  3. fand-ctl status")
     return 0
 
