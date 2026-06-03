@@ -143,6 +143,13 @@ respond proportional to phase 3's measured ΔT per sensor. As the daemon
 collects equilibrium samples and refits, the seed weights are replaced
 with learned γ.
 
+The same seed fallback applies if a trained sensor's learned γ comes out
+all-zero (closed-loop data biases γ toward zero — the controller ramps
+fans *because* temps rise, so PWM correlates positively with temperature
+until load features deconfound it). Invariant: learning may refine the
+cooling map, never erase it — a sensor under stress always retains at
+least its calibration-measured fan response.
+
 ## How the cooling matrix evolves
 
 The actual fan↔sensor cooling relationships are learned, not declared.
@@ -170,9 +177,23 @@ water heat → CPU temp) emerge with large γ. Weak or coincidental
 relationships (e.g. `pwm4 → dimm_a`, since rad fans don't really cool RAM
 directly) trend toward zero — and get clipped to 0 post-fit.
 
+The regression only fits coefficients the data can identify. A fan whose
+PWM never varied across the pool, or a load feature pinned at one value
+(GPU util sitting at 99 % through a long training run), is collinear with
+the intercept and carries no information about its own coefficient —
+those columns are excluded from the solve. Unidentified fans keep their
+seed-derived γ; unidentified features fold their constant contribution
+into the baseline. Columns re-enter automatically on later refits once
+the rolling pool spans enough load regimes. The solve itself runs on
+standardized columns with an unpenalized intercept, so the ridge penalty
+is uniform across column scales and the baseline lands at a physical
+temperature.
+
 Until n_samples per sensor is high enough, γ stays regularized toward the
 seed weights — partial trust in the learned values, partial trust in
-phase 3.
+phase 3. The trust ramp applies per fan, and only to fans the data
+identified; sample count is not information about a coefficient the data
+can't see.
 
 **t > 1 d** (mature). The full (fan × sensor) γ matrix is well-fit. Seed
 weights are mostly irrelevant; learned coefficients drive control. The

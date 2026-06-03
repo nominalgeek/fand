@@ -401,6 +401,8 @@ class Daemon:
                 min_r2=float(self.config.get("min_r2_to_learn", 0.7)),
                 ff_alpha=float(self.config.get("ff_alpha", 0.05)),
                 fully_trained_n=int(self.config.get("fully_trained_n", 500)),
+                min_pwm_spread=float(self.config.get("min_pwm_spread", 10.0)),
+                min_feature_cov=float(self.config.get("min_feature_cov", 0.05)),
             )
         load_models_into(MODEL_PATH, self.sensor_models)
 

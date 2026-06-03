@@ -38,6 +38,21 @@ feature_abs_tolerance: 2.0
 # equilibrium pool.
 fit_interval_s: 3600.0
 
+# Minimum PWM range (counts) a fan must cover across the equilibrium pool for
+# its cooling coefficient γ to be fit from data. A fan that never moved gives
+# the regression nothing to identify γ from (its constant column is collinear
+# with the intercept), so below this spread the fan keeps its calibration seed
+# weight regardless of sample count.
+min_pwm_spread: 10.0
+
+# Minimum relative variation (std / mean) a load feature must show across the
+# equilibrium pool for its α coefficient to be fit. A feature pinned at one
+# value (GPU util sitting at 99% through a long training run) is collinear
+# with the intercept and its fitted coefficient explodes on tiny noise; below
+# this threshold the feature's constant contribution folds into the baseline
+# instead. Columns re-enter automatically once the pool spans load regimes.
+min_feature_cov: 0.05
+
 # Ridge regularization. Higher = smoother, more biased. Sane range: 0.1 – 10.
 ridge_lambda: 1.0
 

@@ -118,6 +118,8 @@ class SensorModel:
         min_r2: float = 0.7,
         ff_alpha: float = 0.05,
         fully_trained_n: int = 500,
+        min_pwm_spread: float = 10.0,
+        min_feature_cov: float = 0.05,
     ):
         """
         cools_seeds: {fan_name: ΔT °C from phase 3}. Used for relevance
@@ -126,6 +128,14 @@ class SensorModel:
 
         fully_trained_n: sample count at which γ is fully driven by data
         (vs blended with seed). Linear blend below this.
+
+        min_pwm_spread: minimum PWM range (counts) a fan must cover across
+        the sample pool for its γ to be fit from data; below it the fan's γ
+        stays seed-derived (the coefficient is unidentifiable).
+
+        min_feature_cov: minimum relative variation (std / max(|mean|, 1))
+        a load feature must show across the pool for its α to be fit; below
+        it the feature's constant contribution folds into the baseline.
         """
         self.name = name
         self.target_c = target_c
@@ -135,6 +145,8 @@ class SensorModel:
         self.min_samples = min_samples
         self.min_r2 = min_r2
         self.fully_trained_n = fully_trained_n
+        self.min_pwm_spread = min_pwm_spread
+        self.min_feature_cov = min_feature_cov
         self.ff = FeedForwardState(alpha=ff_alpha)
         self.state = SensorState()
 
@@ -201,50 +213,93 @@ class SensorModel:
         fan_names: list[str],
     ) -> None:
         """Ridge regression on equilibrium samples. Drops samples missing this
-        sensor's temp reading. Clips γ ≥ 0 post-solve and blends with seed
-        weights for low-n fits.
+        sensor's temp reading. Solves on standardized columns with an
+        unpenalized intercept, over only the PWM columns that actually varied;
+        clips γ ≥ 0 post-solve and blends per-fan with seed weights while a
+        fan's data is thin.
         """
         usable = [s for s in samples if self.name in s.temps]
-        n_params = 1 + len(feature_names) + len(fan_names)  # baseline + α + (−γ)
+
+        # Identifiability: a column with (near-)constant value is collinear
+        # with the intercept — the solver would use it as an intercept
+        # surrogate and hallucinate a coefficient for an input that never
+        # moved (and the standardized back-transform divides by the tiny σ,
+        # exploding it). Only fans whose PWM actually varied and features
+        # with real relative variation across the pool enter the regression;
+        # excluded fans keep seed-derived γ below, excluded features fold
+        # their constant contribution into the baseline. As the rolling pool
+        # spans more load regimes, columns re-enter on later refits.
+        id_fans: list[str] = []
+        id_feats: list[str] = []
+        if usable:
+            for p in fan_names:
+                col = [float(s.pwm.get(p, 0)) for s in usable]
+                if max(col) - min(col) >= self.min_pwm_spread:
+                    id_fans.append(p)
+            for fn in feature_names:
+                fcol = np.asarray([s.features.get(fn, 0.0) for s in usable])
+                cov = float(fcol.std()) / max(abs(float(fcol.mean())), 1.0)
+                if cov >= self.min_feature_cov:
+                    id_feats.append(fn)
+
+        n_params = 1 + len(id_feats) + len(id_fans)  # baseline + α + (−γ)
         # Need enough rows to reliably separate the coefficients
         min_for_fit = max(10, 2 * n_params)
         if len(usable) < min_for_fit:
+            log.info(
+                "[sensor %s] fit: too few samples (%d < %d)",
+                self.name, len(usable), min_for_fit,
+            )
             return
 
-        # X columns: [1, features..., −pwm_fan_p1, −pwm_fan_p2, ...]
+        # Design matrix without intercept column: [features..., −pwm...].
         # Negative PWM columns so the solved coefficient comes out as γ ≥ 0
         # (matching the model T_s = ... − γ·pwm).
-        X = np.zeros((len(usable), n_params))
-        y = np.zeros(len(usable))
+        n = len(usable)
+        F = np.zeros((n, len(id_feats) + len(id_fans)))
+        y = np.zeros(n)
         for i, s in enumerate(usable):
-            X[i, 0] = 1.0
-            for j, fn in enumerate(feature_names):
-                X[i, 1 + j] = s.features.get(fn, 0.0)
-            for j, p in enumerate(fan_names):
-                X[i, 1 + len(feature_names) + j] = -float(s.pwm.get(p, 0))
+            for j, fn in enumerate(id_feats):
+                F[i, j] = s.features.get(fn, 0.0)
+            for j, p in enumerate(id_fans):
+                F[i, len(id_feats) + j] = -float(s.pwm.get(p, 0))
             y[i] = s.temps[self.name]
 
         # Hold out last 20% for honest R²
-        n = len(usable)
         n_train = max(int(n * 0.8), n - 50)
-        Xtr, ytr = X[:n_train], y[:n_train]
-        Xts, yts = X[n_train:], y[n_train:]
+        Ftr, ytr = F[:n_train], y[:n_train]
+        Fts, yts = F[n_train:], y[n_train:]
 
+        # Standardize for the solve. Ridge's penalty is scale-dependent:
+        # explaining a constant 50 °C costs 50² through the intercept but
+        # ~(50/680)² through a ups_w-sized column, so an unstandardized solve
+        # shoves the DC temperature level into the large columns and α/γ stop
+        # meaning marginal effects. Solve in z-scored space (uniform penalty,
+        # intercept = column means, unpenalized), back-transform after.
+        mu = Ftr.mean(axis=0)
+        sigma = Ftr.std(axis=0)
+        informative = sigma > 1e-9
+        sigma_safe = np.where(informative, sigma, 1.0)
+        Z = (Ftr - mu) / sigma_safe
+        yc = ytr - ytr.mean()
+        k = Z.shape[1]
         try:
-            A = Xtr.T @ Xtr + self.ridge_lambda * np.eye(n_params)
-            b = Xtr.T @ ytr
-            theta = np.linalg.solve(A, b)
+            A = Z.T @ Z + self.ridge_lambda * np.eye(k)
+            b = Z.T @ yc
+            theta_std = np.linalg.solve(A, b)
         except np.linalg.LinAlgError as exc:
             log.warning("[sensor %s] fit: solve failed: %s", self.name, exc)
             return
+        # Back-transform; constant columns carry no information → coef 0.
+        theta_raw = np.where(informative, theta_std / sigma_safe, 0.0)
+        baseline = float(ytr.mean() - theta_raw @ mu)
 
-        baseline = float(theta[0])
         alpha_dict = {
-            feature_names[j]: float(theta[1 + j]) for j in range(len(feature_names))
+            id_feats[j]: float(theta_raw[j]) for j in range(len(id_feats))
         }
         gamma_raw = {
-            fan_names[j]: float(theta[1 + len(feature_names) + j])
-            for j in range(len(fan_names))
+            id_fans[j]: float(theta_raw[len(id_feats) + j])
+            for j in range(len(id_fans))
         }
         gamma_dict = {fn: max(0.0, g) for fn, g in gamma_raw.items()}
 
@@ -259,17 +314,24 @@ class SensorModel:
                     self.name, fn, g_raw, seed,
                 )
 
-        # Blend with seed weights for low-confidence fits. Seeds are in °C ΔT;
-        # γ is in °C per PWM unit. Convert via a rough PWM-range divisor so the
-        # blend lives on a comparable scale.
+        # Blend learned γ with seeds per fan. Seeds are in °C ΔT; γ is in °C
+        # per PWM unit. Convert via a rough PWM-range divisor so the blend
+        # lives on a comparable scale. Identified fans earn trust with sample
+        # count; fans whose PWM never moved hold pure seed weight regardless
+        # of n — sample count is not information about a coefficient the data
+        # can't see.
         trust = min(1.0, n / max(1, self.fully_trained_n))
         seed_pwm_scale = 100.0  # ΔT_phase3 / 100 ≈ γ if fan drops PWM by 100 units
-        for fn in gamma_dict:
+        blended: dict[str, float] = {}
+        for fn in fan_names:
             seed_g = self.cools_seeds.get(fn, 0.0) / seed_pwm_scale
-            gamma_dict[fn] = (1 - trust) * seed_g + trust * gamma_dict[fn]
+            if fn in gamma_dict:
+                blended[fn] = (1 - trust) * seed_g + trust * gamma_dict[fn]
+            else:
+                blended[fn] = seed_g
 
         if len(yts) >= 5:
-            yhat = Xts @ theta
+            yhat = baseline + Fts @ theta_raw
             ss_res = float(np.sum((yts - yhat) ** 2))
             ss_tot = float(np.sum((yts - yts.mean()) ** 2))
             r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan")
@@ -278,16 +340,16 @@ class SensorModel:
 
         self.state.baseline = baseline
         self.state.load_coefs = alpha_dict
-        self.state.cooling_coefs = gamma_dict
+        self.state.cooling_coefs = blended
         self.state.r2 = r2
         self.state.n_samples = n
         self.state.last_fit_t = usable[-1].t
 
         log.info(
-            "[sensor %s] fit n=%d r²=%.3f baseline=%.2f α=%s γ=%s",
-            self.name, n, r2, baseline,
+            "[sensor %s] fit n=%d r²=%.3f baseline=%.2f id_fans=%s id_feats=%s α=%s γ=%s",
+            self.name, n, r2, baseline, id_fans, id_feats,
             {k: round(v, 4) for k, v in alpha_dict.items()},
-            {k: round(v, 5) for k, v in gamma_dict.items() if v > 1e-5},
+            {k: round(v, 5) for k, v in blended.items() if v > 1e-5},
         )
 
     # ---- persistence ---------------------------------------------------
