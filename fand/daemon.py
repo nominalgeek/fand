@@ -313,7 +313,27 @@ class Daemon:
         self.equilibrium_pwm_stable_s = float(
             self.config.get("equilibrium_pwm_stable_s", 30.0)
         )
-        self.equilibrium_window_n = max(8, int(self.equilibrium_window_s / self.poll_interval))
+        # A window of n samples spans (n-1)*poll seconds; +1 so the window
+        # actually covers equilibrium_window_s (the gate requires the window to
+        # span at least pwm_stable_s, so an int() truncation here left it one
+        # poll short and the equilibrium detector never fired).
+        self.equilibrium_window_n = max(
+            8, int(self.equilibrium_window_s / self.poll_interval) + 1
+        )
+        # Equilibrium-detector tolerances (all operator-tunable; defaults are
+        # what is_fan_equilibrium uses if absent).
+        self.equilibrium_feature_cov = float(
+            self.config.get("feature_cov_threshold", 0.10)
+        )
+        self.equilibrium_feature_abs_tol = float(
+            self.config.get("feature_abs_tolerance", 2.0)
+        )
+        self.equilibrium_temp_slope = float(
+            self.config.get("temp_slope_threshold", 0.05)
+        )
+        self.equilibrium_pwm_jitter = int(
+            self.config.get("pwm_jitter_tolerance", 4)
+        )
         self.ntfy_cmd = self.config.get("ntfy_command")
         self.history_enabled = bool(self.config.get("history_enabled", True))
         self.chip_name = self.config.get("chip_name", "nct6799")
@@ -574,6 +594,10 @@ class Daemon:
                     cooled_sensors=cooled,
                     feature_names=feature_names,
                     pwm_stable_s=self.equilibrium_pwm_stable_s,
+                    pwm_jitter_tolerance=self.equilibrium_pwm_jitter,
+                    temp_slope_threshold=self.equilibrium_temp_slope,
+                    feature_cov_threshold=self.equilibrium_feature_cov,
+                    feature_abs_tolerance=self.equilibrium_feature_abs_tol,
                 ):
                     sample = EquilibriumSample(
                         t=obs.t,

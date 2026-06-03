@@ -397,7 +397,8 @@ def is_fan_equilibrium(
     pwm_stable_s: float = 30.0,
     pwm_jitter_tolerance: int = 4,
     temp_slope_threshold: float = 0.05,
-    feature_variance_pct: float = 0.05,
+    feature_cov_threshold: float = 0.10,
+    feature_abs_tolerance: float = 2.0,
 ) -> bool:
     """Decide if the window represents an equilibrium for `fan_name`'s fit.
 
@@ -406,7 +407,11 @@ def is_fan_equilibrium(
        window AND the window covers at least `pwm_stable_s` seconds.
     2. Every sensor in `cooled_sensors` that's present in the window's temps
        has |dT/dt| ≤ `temp_slope_threshold` °C/s.
-    3. Feature relative range max(|range|/|mean|+1) ≤ `feature_variance_pct`.
+    3. Every feature is stable: its within-window coefficient of variation
+       (std / max(|mean|, 1)) ≤ `feature_cov_threshold`, OR its raw std ≤
+       `feature_abs_tolerance`. The absolute fallback keeps inherently
+       low-magnitude, jittery signals (idle CPU util) from gating every
+       window, while still rejecting genuine load swings.
 
     Window entries are (t, temps_dict, features_dict, pwm_dict).
     """
@@ -442,14 +447,16 @@ def is_fan_equilibrium(
         if abs(slope) > temp_slope_threshold:
             return False
 
-    # Feature variance.
+    # Feature stability: every feature must be either relatively stable (low
+    # coefficient of variation) or absolutely near-constant (small raw std).
     if feature_names:
         feats = np.asarray(
             [[w[2].get(fn, 0.0) for fn in feature_names] for w in window]
         )
-        rng = feats.max(axis=0) - feats.min(axis=0)
+        std = feats.std(axis=0)
         base = np.maximum(np.abs(feats.mean(axis=0)), 1.0)
-        if float((rng / base).max()) > feature_variance_pct:
+        stable = (std / base <= feature_cov_threshold) | (std <= feature_abs_tolerance)
+        if not bool(stable.all()):
             return False
 
     return True

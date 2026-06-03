@@ -20,6 +20,20 @@ equilibrium_window_s: 30.0
 # hasn't yet stopped adjusting PWM.
 equilibrium_pwm_stable_s: 30.0
 
+# Equilibrium-detector tolerances. A window is an equilibrium only when, across
+# it: the fan's PWM jitter stays within pwm_jitter_tolerance counts; every
+# cooled sensor's |dT/dt| stays under temp_slope_threshold (°C/s); and every
+# load feature is stable. A feature counts as stable if its coefficient of
+# variation (std/mean) is under feature_cov_threshold OR its raw std is under
+# feature_abs_tolerance — the absolute fallback keeps inherently jittery, low-
+# magnitude signals (e.g. idle CPU util) from blocking every window. Loosen the
+# cov/abs tolerances if equilibria accrue too slowly; tighten if the learned
+# fits look noisy.
+pwm_jitter_tolerance: 4
+temp_slope_threshold: 0.05
+feature_cov_threshold: 0.10
+feature_abs_tolerance: 2.0
+
 # Re-fit per-sensor ridge regressions every N seconds from the rolling
 # equilibrium pool.
 fit_interval_s: 3600.0
