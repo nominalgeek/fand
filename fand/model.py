@@ -173,14 +173,19 @@ class SensorModel:
         """Fan `fan_name`'s contribution to cooling this sensor, normalized
         to [0, 1] against the strongest cooler. Untrained → uses seed weights;
         trained → uses learned γ.
+
+        A trained model whose γ solved to all-zero (closed-loop data drags γ
+        negative — fans ramp *because* temps rise — and the clip floors it at
+        0) falls back to seeds rather than returning 0 for every fan: learning
+        may refine the cooling map, never erase it. A sensor under stress must
+        always retain at least its calibration-measured fan response.
         """
         if self.is_trained() and self.state.cooling_coefs:
             coefs = self.state.cooling_coefs
             max_g = max(coefs.values()) if coefs else 0.0
-            if max_g <= 0:
-                return 0.0
-            return max(0.0, coefs.get(fan_name, 0.0) / max_g)
-        # Untrained — fall back to phase-3 seeds
+            if max_g > 0:
+                return max(0.0, coefs.get(fan_name, 0.0) / max_g)
+            # learned γ carries no signal — fall through to seeds
         seeds = self.cools_seeds
         max_seed = max(seeds.values()) if seeds else 0.0
         if max_seed <= 0:
