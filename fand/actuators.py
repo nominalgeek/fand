@@ -147,10 +147,11 @@ class Actuators:
             return False
         return True
 
-    def set_all(self, value: int) -> None:
-        """Emergency: drive every managed channel to one value."""
-        for ch in self.handles:
-            self.set_pwm(ch, value)
+    def set_all(self, value: int) -> list[str]:
+        """Emergency: drive every managed channel to one value. Returns the
+        channels whose write failed verification — the critical path must
+        not assume 255 took."""
+        return [ch for ch in self.handles if not self.set_pwm(ch, value)]
 
     # ----- context-manager glue ------------------------------------------
 

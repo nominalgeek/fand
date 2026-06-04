@@ -67,6 +67,7 @@ STATUS_PATH = RUN_DIR / "status.json"
 HISTORY_RETENTION_DAYS = 30
 FAN_DEAD_STREAK = 3  # ~6s at default 2s poll, skips mechanical spin-up on cold start
 SENSOR_RECOVER_STREAK = 3  # consecutive good reads to clear assumed-critical (anti-flap)
+PWM_WRITE_FAIL_STREAK = 3  # consecutive failed write verifications before re-takeover
 TICK_FAIL_LIMIT = 5  # consecutive tick exceptions before exiting for systemd restart
 EQUILIBRIA_MAXLEN = 20000
 
@@ -467,6 +468,7 @@ class Daemon:
         self._stop = False
         self._last_alarm_t: dict[str, float] = {}
         self._fan_fault_streak: dict[str, int] = {fn: 0 for fn in self.fan_configs}
+        self._pwm_fault_streak: dict[str, int] = {fn: 0 for fn in self.fan_configs}
 
         log.info(
             "daemon initialized: %d sensors, %d fans, equilibrium_window=%.0fs",
@@ -711,13 +713,46 @@ class Daemon:
         for name, T_eff in sensor_effective_temps.items():
             stresses[name] = self.sensor_models[name].stress(T_eff)
 
+        # Enable-mode drift: BIOS can reassert pwm_enable behind our back
+        # (e.g. after suspend/resume). Write read-back can't catch the case
+        # where the duty register still happens to match, so check the
+        # observed enables directly. obs.pwm_enable is empty when the chip
+        # read failed this tick — `en is not None` keeps that from triggering
+        # a takeover storm. One take_over() covers every channel, hence break.
+        for fn, fc in self.fan_configs.items():
+            en = obs.pwm_enable.get(fc.pwm_channel)
+            if en is not None and en != 1:
+                self._alarm(
+                    f"enable_drift:{fn}",
+                    f"{fc.pwm_channel} enable={en} (expected manual 1) — re-taking over",
+                    cooldown_s=60.0,
+                )
+                self.actuators.take_over()
+                break
+
         # Per-fan PWM decision
         applied: dict[str, int] = {}
         sources: dict[str, str] = {}
         breakdowns: dict[str, list[tuple[str, float, float, float]]] = {}
 
         if any_critical:
-            self.actuators.set_all(255)
+            failed = self.actuators.set_all(255)
+            if failed:
+                # The one write that must not fail silently. Re-assert manual
+                # mode (BIOS may have grabbed the channel) and retry once; a
+                # take_over() failure raises into the loop's failure counter.
+                log.error(
+                    "critical set_all(255) failed verification on %s — re-taking over",
+                    failed,
+                )
+                self.actuators.take_over()
+                failed = self.actuators.set_all(255)
+                if failed:
+                    self._alarm(
+                        "pwm_write_fail:critical",
+                        f"channels {', '.join(failed)} not honoring 255 during critical",
+                        cooldown_s=60.0,
+                    )
             for fn in self.fan_configs:
                 applied[fn] = 255
                 sources[fn] = "critical"
@@ -726,7 +761,19 @@ class Daemon:
             for fn, fc in self.fan_configs.items():
                 demand, parts = aggregate_demand(fn, fc.cools, stresses, self.sensor_models)
                 pwm = demand_to_pwm(demand, fc.pwm_min)
-                self.actuators.set_pwm(fc.pwm_channel, pwm)
+                if self.actuators.set_pwm(fc.pwm_channel, pwm):
+                    self._pwm_fault_streak[fn] = 0
+                else:
+                    self._pwm_fault_streak[fn] += 1
+                    if self._pwm_fault_streak[fn] >= PWM_WRITE_FAIL_STREAK:
+                        self._alarm(
+                            f"pwm_write_fail:{fn}",
+                            f"{fn} ({fc.pwm_channel}) failed write verification "
+                            f"{self._pwm_fault_streak[fn]} ticks — re-taking over",
+                        )
+                        self.actuators.take_over()
+                        self.actuators.set_pwm(fc.pwm_channel, pwm)
+                        self._pwm_fault_streak[fn] = 0
                 applied[fn] = pwm
                 any_trained_cools = any(
                     sn in self.sensor_models and self.sensor_models[sn].is_trained()
