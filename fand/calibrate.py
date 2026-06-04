@@ -256,12 +256,17 @@ def attribute_fans(
         actuators.set_pwm(ch, ATTRIBUTION_BASELINE_PWM)
     _settle(ATTRIBUTION_BASELINE_SETTLE_S)
 
-    baseline = _average_temps(sensors_obj)
-    log.info("  baseline (top 5 hottest):")
-    for (chip, label), val in sorted(baseline.items(), key=lambda kv: -kv[1])[:5]:
-        log.info("    %s/%s: %.1f°C", chip, label, val)
-
     for target in managed:
+        # Re-sample the baseline immediately before each fan's drop. Each
+        # perturbation dumps heat into the chassis that the recovery window
+        # doesn't fully clear, so a single pre-run baseline goes stale by
+        # fan 2+ and inflates every later ΔT. A fresh pre-drop baseline
+        # absorbs the drift; each ΔT measures only this fan's effect.
+        baseline = _average_temps(sensors_obj)
+        log.info("  pre-drop baseline for %s (top 5 hottest):", target)
+        for (chip, label), val in sorted(baseline.items(), key=lambda kv: -kv[1])[:5]:
+            log.info("    %s/%s: %.1f°C", chip, label, val)
+
         log.info(
             "attributing %s: dropping pwm=%d→%d for %.0fs ...",
             target, ATTRIBUTION_BASELINE_PWM, pwm_min[target], ATTRIBUTION_DROP_DURATION_S,
