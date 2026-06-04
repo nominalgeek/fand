@@ -18,6 +18,14 @@ dependencies = [
 [project.urls]
 Homepage = "https://github.com/nominalgeek/fand"
 
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
 [project.scripts]
 fand-ctl = "fand.cli:main"
 fand-calibrate = "fand.calibrate:main"
