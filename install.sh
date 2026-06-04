@@ -10,8 +10,8 @@
 # runs from. To pick up source changes, re-run this script.
 #
 # Does NOT start the service — operator must:
-#   1. sudo fand-calibrate                 (discovers PWM↔fan mapping; ~5 min)
-#   2. sudo $EDITOR /etc/fand/zones.yaml   (fill in target_sensors per zone)
+#   1. sudo fand-calibrate                 (PWM↔fan mapping + seed weights; ~15 min)
+#   2. sudo $EDITOR /etc/fand/zones.yaml   (review sensors' target_c/critical_c, fans' cools)
 #   3. sudo systemctl start fand
 set -euo pipefail
 
@@ -118,12 +118,15 @@ re-run:
 
 Next steps:
   1) sudo fand-calibrate
-       Discovers which PWM controls which fan; writes /etc/fand/zones.yaml.
-       Run with the system IDLE (stop ComfyUI / training). Takes ~5 minutes.
+       Maps PWM channels to fans, finds each fan's pwm_min, and measures
+       seed cooling weights (phase 3); writes /etc/fand/zones.yaml.
+       Phases 1+2 want the system IDLE; phase 3 wants a typical workload
+       running. Takes ~15 minutes total.
 
   2) sudo \$EDITOR /etc/fand/zones.yaml
-       Set 'target_sensors' for each zone — pick the temps you want that fan
-       to hold under control. Chip names + labels: \`sensors\` for guidance.
+       Review the 'sensors:' catalog — trim what you don't care about and
+       tune each sensor's target_c / critical_c. Check each fan's 'cools:'
+       seed weights; add sensors phase 3 missed.
 
   3) sudo systemctl start fand
        Bring it up. Watch with \`fand-ctl status\` and \`journalctl -u fand -f\`.

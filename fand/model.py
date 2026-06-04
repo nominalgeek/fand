@@ -275,7 +275,19 @@ class SensorModel:
                 F[i, len(id_feats) + j] = -float(s.pwm.get(p, 0))
             y[i] = s.temps[self.name]
 
-        # Hold out last 20% for honest R²
+        # Hold out the chronological tail (last 20%, capped at 50 rows).
+        # Chronological — not random/blocked — on purpose: equilibrium rows
+        # are near-duplicates by construction (the detector demands ≥30 s of
+        # flat temps and stable features), so any split that mixes
+        # time-adjacent rows across train/test leaks near-twins into the
+        # holdout, deflates RMSE, and opens the is_trained() gate on a model
+        # that can't generalize. Chronological errs pessimistic under regime
+        # shift — gate stays closed, control stays on seeds — which fails
+        # safe. The cap means rmse validates the *most recent* regime, not
+        # all regimes; that residual optimism (flat recent tail) can't
+        # promote a bad data-learned γ because the identifiability guards
+        # above run on the whole pool, and an all-zero γ falls back to seeds
+        # in relevance().
         n_train = max(int(n * 0.8), n - 50)
         Ftr, ytr = F[:n_train], y[:n_train]
         Fts, yts = F[n_train:], y[n_train:]

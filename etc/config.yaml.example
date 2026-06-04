@@ -77,6 +77,8 @@ ridge_lambda: 1.0
 # samples are steady-state by construction, so the holdout window is near-flat
 # and R² = 1 − ss_res/ss_tot explodes on °C-scale offsets no matter how good
 # the model is. R² is still computed and shown as a diagnostic.
+# The holdout is chronological (the most recent samples), so rmse measures the
+# current load regime — expect it to move when the workload changes regime.
 # (min_r2_to_learn is deprecated and ignored.)
 min_samples_to_learn: 200
 max_rmse_to_learn_c: 1.5
