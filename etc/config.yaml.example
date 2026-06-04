@@ -57,11 +57,16 @@ min_feature_cov: 0.05
 ridge_lambda: 1.0
 
 # Per-sensor learning gates:
-#   trained ↔ n_samples ≥ min_samples_to_learn AND r² ≥ min_r2_to_learn
+#   trained ↔ n_samples ≥ min_samples_to_learn AND holdout RMSE ≤ max_rmse_to_learn_c
 # While untrained, relevance weights come from each fan's cools: seed values
 # (phase 3 ΔT) rather than learned γ.
+# The gate is RMSE ("predicts held-out temps within X °C"), not R²: equilibrium
+# samples are steady-state by construction, so the holdout window is near-flat
+# and R² = 1 − ss_res/ss_tot explodes on °C-scale offsets no matter how good
+# the model is. R² is still computed and shown as a diagnostic.
+# (min_r2_to_learn is deprecated and ignored.)
 min_samples_to_learn: 200
-min_r2_to_learn: 0.7
+max_rmse_to_learn_c: 1.5
 
 # Sample count at which γ coefficients are fully data-driven. Below this, γ
 # is blended with the seed weights from zones.yaml (linear toward learned as

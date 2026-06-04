@@ -81,7 +81,7 @@ Phase 3 of calibrate writes seed cooling weights (ΔT °C per sensor) into each 
 - Find hwmon devices by chip **name**, never by `hwmon3`-style index. Indices shift on kernel updates.
 - Multi-instance chips (`nvme[0]`, `spd5118[1]`) require explicit indexing in `zones.yaml`'s sensor declarations — no fuzzy fallback.
 - Sensor functions return `None` on failure; the daemon's safety floors (`set_all(255)` on any sensor crossing `critical_c`) are the backstop. Never raise from a sensor reader.
-- Per-sensor learned state is persistent (`/var/lib/fand/model.json` — `cooling_coefs`, `load_coefs`, `baseline`, `r²`, `n_samples` per sensor) and survives daemon restarts. `equilibria.jsonl` holds the rolling training pool. `history.jsonl` rotates daily, 30 d retention.
+- Per-sensor learned state is persistent (`/var/lib/fand/model.json` — `cooling_coefs`, `load_coefs`, `baseline`, `rmse` (the trained gate), `r²` (diagnostic only), `n_samples` per sensor) and survives daemon restarts. `equilibria.jsonl` holds the rolling training pool. `history.jsonl` rotates daily, 30 d retention.
 - The daemon writes `/run/fand/status.json` every poll atomically (`tempfile` + `os.replace`). Any monitor (Prometheus exporter, dashboard) should scrape that, not the daemon directly.
 - Sensor `target_c` and `critical_c` are operator-set in `zones.yaml`, **not** hardcoded — defaults are conservative but each rig wants tuning. Same for each fan's `cools:` list (initial seed weights come from `fand-calibrate`; operator can edit).
 - UPS feature, NUT loopback, nvidia-smi are all **optional**. If any is missing, the daemon runs without it (load feature defaults to 0; warning logged). `Wants=` not `Requires=` in the systemd unit.

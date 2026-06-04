@@ -89,9 +89,12 @@ def cmd_status(_args: argparse.Namespace) -> int:
         print("  Sensors:")
         print(
             f"    {'name':<22} {'T':>7} {'target':>7} {'crit':>5} "
-            f"{'stress':>6} {'trnd':>4} {'n':>5} {'r²':>5}"
+            f"{'stress':>6} {'trnd':>4} {'n':>5} {'rmse':>5} {'r²':>5}"
         )
-        print(f"    {'-'*22} {'-'*7} {'-'*7} {'-'*5} {'-'*6} {'-'*4} {'-'*5} {'-'*5}")
+        print(
+            f"    {'-'*22} {'-'*7} {'-'*7} {'-'*5} {'-'*6} {'-'*4} {'-'*5} "
+            f"{'-'*5} {'-'*5}"
+        )
         # Sort by stress descending so the hot stuff is at the top
         sorted_sensors = sorted(sensors, key=lambda x: -(x.get("stress") or 0))
         for sn in sorted_sensors:
@@ -105,6 +108,7 @@ def cmd_status(_args: argparse.Namespace) -> int:
                 f"{stress_str:>6} "
                 f"{'yes' if sn.get('trained') else 'no':>4} "
                 f"{sn.get('n_samples', 0):>5} "
+                f"{_fmt_r2(sn.get('rmse')):>5} "
                 f"{_fmt_r2(sn.get('r2')):>5}{marker}"
             )
 
@@ -216,9 +220,10 @@ def cmd_model(_args: argparse.Namespace) -> int:
     # ---- Per-sensor coefs ----
     print("Per-sensor models:")
     print(
-        f"  {'sensor':<22} {'target':>6} {'crit':>4} {'n':>5} {'r²':>5} {'baseline':>9}"
+        f"  {'sensor':<22} {'target':>6} {'crit':>4} {'n':>5} {'rmse':>5} "
+        f"{'r²':>5} {'baseline':>9}"
     )
-    print(f"  {'-'*22} {'-'*6} {'-'*4} {'-'*5} {'-'*5} {'-'*9}")
+    print(f"  {'-'*22} {'-'*6} {'-'*4} {'-'*5} {'-'*5} {'-'*5} {'-'*9}")
     fan_names: set[str] = set()
     for name, sd in sorted(sensors_dict.items()):
         st = sd.get("state", {})
@@ -226,10 +231,12 @@ def cmd_model(_args: argparse.Namespace) -> int:
         crit = sd.get("critical_c", 0)
         n = st.get("n_samples", 0)
         r2 = st.get("r2")
+        rmse = st.get("rmse")
         baseline = st.get("baseline")
+        baseline_str = f"{baseline:.2f}" if baseline is not None else "-"
         print(
             f"  {name:<22} {target:>4.0f}°C {crit:>2.0f}°C {n:>5} "
-            f"{_fmt_r2(r2):>5} {baseline if baseline is not None else '-':>9}"
+            f"{_fmt_r2(rmse):>5} {_fmt_r2(r2):>5} {baseline_str:>9}"
         )
         fan_names.update((st.get("cooling_coefs") or {}).keys())
 

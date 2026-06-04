@@ -21,9 +21,12 @@ At runtime:
     PWM(p)       = pwm_min(p) + demand(p) × (255 − pwm_min(p))
 
 Until enough equilibrium samples accumulate per sensor (`min_samples_to_learn`)
-and the holdout R² clears `min_r2_to_learn`, relevance uses the seed cooling
-weights from each fan's `cools:` block in zones.yaml — phase 3's measured ΔT
-per sensor. Once trained, the learned γ takes over.
+and the holdout RMSE drops under `max_rmse_to_learn_c`, relevance uses the seed
+cooling weights from each fan's `cools:` block in zones.yaml — phase 3's
+measured ΔT per sensor. Once trained, the learned γ takes over. (Holdout R² is
+kept as a diagnostic only: equilibrium holdouts are near-flat by construction,
+so 1 − ss_res/ss_tot explodes on small offsets and even a perfect model can't
+clear a positive R² bar — it cannot gate anything.)
 
 AR(1) feed-forward: per sensor, an EMA of the load-feature vector. When the
 sensor is trained, the difference between current features and the EMA is
@@ -70,6 +73,7 @@ class SensorState:
     load_coefs: dict[str, float] = field(default_factory=dict)   # α
     cooling_coefs: dict[str, float] = field(default_factory=dict)  # γ (≥ 0)
     r2: float | None = None
+    rmse: float | None = None
     n_samples: int = 0
     last_fit_t: float = 0.0
 
@@ -115,7 +119,7 @@ class SensorModel:
         cools_seeds: dict[str, float],
         ridge_lambda: float = 1.0,
         min_samples: int = 200,
-        min_r2: float = 0.7,
+        max_rmse_c: float = 1.5,
         ff_alpha: float = 0.05,
         fully_trained_n: int = 500,
         min_pwm_spread: float = 10.0,
@@ -136,6 +140,12 @@ class SensorModel:
         min_feature_cov: minimum relative variation (std / max(|mean|, 1))
         a load feature must show across the pool for its α to be fit; below
         it the feature's constant contribution folds into the baseline.
+
+        max_rmse_c: holdout RMSE (°C) the fit must beat for the sensor to
+        count as trained. RMSE rather than R²: equilibrium holdouts are
+        near-flat, so R² explodes on small offsets regardless of model
+        quality, while "predicts held-out temps within X °C" stays
+        meaningful.
         """
         self.name = name
         self.target_c = target_c
@@ -143,7 +153,7 @@ class SensorModel:
         self.cools_seeds = dict(cools_seeds)
         self.ridge_lambda = ridge_lambda
         self.min_samples = min_samples
-        self.min_r2 = min_r2
+        self.max_rmse_c = max_rmse_c
         self.fully_trained_n = fully_trained_n
         self.min_pwm_spread = min_pwm_spread
         self.min_feature_cov = min_feature_cov
@@ -154,9 +164,9 @@ class SensorModel:
 
     def is_trained(self) -> bool:
         return (
-            self.state.r2 is not None
+            self.state.rmse is not None
             and self.state.n_samples >= self.min_samples
-            and self.state.r2 >= self.min_r2
+            and self.state.rmse <= self.max_rmse_c
             and bool(self.state.cooling_coefs)
         )
 
@@ -330,24 +340,33 @@ class SensorModel:
             else:
                 blended[fn] = seed_g
 
+        # Holdout metrics. RMSE is the trained gate: "predicts held-out temps
+        # within max_rmse_c °C" stays meaningful on the near-flat holdouts
+        # equilibrium sampling produces. R² is diagnostic only — with
+        # ss_tot ≈ 0 it explodes on small offsets no matter how good the fit.
         if len(yts) >= 5:
             yhat = baseline + Fts @ theta_raw
             ss_res = float(np.sum((yts - yhat) ** 2))
             ss_tot = float(np.sum((yts - yts.mean()) ** 2))
             r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan")
+            rmse: float | None = float(np.sqrt(ss_res / len(yts)))
         else:
             r2 = float("nan")
+            rmse = None
 
         self.state.baseline = baseline
         self.state.load_coefs = alpha_dict
         self.state.cooling_coefs = blended
         self.state.r2 = r2
+        self.state.rmse = rmse
         self.state.n_samples = n
         self.state.last_fit_t = usable[-1].t
 
         log.info(
-            "[sensor %s] fit n=%d r²=%.3f baseline=%.2f id_fans=%s id_feats=%s α=%s γ=%s",
-            self.name, n, r2, baseline, id_fans, id_feats,
+            "[sensor %s] fit n=%d rmse=%s r²=%.3f baseline=%.2f id_fans=%s id_feats=%s α=%s γ=%s",
+            self.name, n,
+            f"{rmse:.2f}" if rmse is not None else "-",
+            r2, baseline, id_fans, id_feats,
             {k: round(v, 4) for k, v in alpha_dict.items()},
             {k: round(v, 5) for k, v in blended.items() if v > 1e-5},
         )
@@ -363,6 +382,7 @@ class SensorModel:
                 "load_coefs": self.state.load_coefs,
                 "cooling_coefs": self.state.cooling_coefs,
                 "r2": self.state.r2,
+                "rmse": self.state.rmse,
                 "n_samples": self.state.n_samples,
                 "last_fit_t": self.state.last_fit_t,
             },
@@ -374,6 +394,7 @@ class SensorModel:
         self.state.load_coefs = s.get("load_coefs", {}) or {}
         self.state.cooling_coefs = s.get("cooling_coefs", {}) or {}
         self.state.r2 = s.get("r2")
+        self.state.rmse = s.get("rmse")
         self.state.n_samples = s.get("n_samples", 0)
         self.state.last_fit_t = s.get("last_fit_t", 0.0)
 

@@ -334,6 +334,11 @@ class Daemon:
         self.equilibrium_pwm_jitter = int(
             self.config.get("pwm_jitter_tolerance", 4)
         )
+        if "min_r2_to_learn" in self.config:
+            log.warning(
+                "config key min_r2_to_learn is no longer used — the trained "
+                "gate is holdout RMSE now (max_rmse_to_learn_c, default 1.5 °C)"
+            )
         self.ntfy_cmd = self.config.get("ntfy_command")
         self.history_enabled = bool(self.config.get("history_enabled", True))
         self.chip_name = self.config.get("chip_name", "nct6799")
@@ -398,7 +403,7 @@ class Daemon:
                 cools_seeds=cools_seeds_by_sensor.get(name, {}),
                 ridge_lambda=float(self.config.get("ridge_lambda", 1.0)),
                 min_samples=int(self.config.get("min_samples_to_learn", 200)),
-                min_r2=float(self.config.get("min_r2_to_learn", 0.7)),
+                max_rmse_c=float(self.config.get("max_rmse_to_learn_c", 1.5)),
                 ff_alpha=float(self.config.get("ff_alpha", 0.05)),
                 fully_trained_n=int(self.config.get("fully_trained_n", 500)),
                 min_pwm_spread=float(self.config.get("min_pwm_spread", 10.0)),
@@ -664,6 +669,7 @@ class Daemon:
                 "trained": sm.is_trained(),
                 "n_samples": sm.state.n_samples,
                 "r2": sm.state.r2,
+                "rmse": sm.state.rmse,
             })
 
         fans_state = []
