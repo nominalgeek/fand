@@ -144,7 +144,10 @@ def read_nvidia_gpu() -> dict[str, float] | None:
             ],
             capture_output=True,
             text=True,
-            timeout=5,
+            # Healthy nvidia-smi answers in well under a second; the timeout
+            # only matters when the driver wedges, where it bounds how slow
+            # every poll gets (the whole tick runs sequentially).
+            timeout=3,
             check=True,
         )
     except (subprocess.SubprocessError, FileNotFoundError) as exc:
@@ -186,7 +189,8 @@ def read_ups(name: str = "cyberpower") -> dict[str, float] | None:
             ["upsc", name],
             capture_output=True,
             text=True,
-            timeout=3,
+            # Local NUT socket; same reasoning as the nvidia-smi timeout.
+            timeout=2,
             check=True,
         )
     except (subprocess.SubprocessError, FileNotFoundError) as exc:

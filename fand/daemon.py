@@ -67,6 +67,7 @@ STATUS_PATH = RUN_DIR / "status.json"
 HISTORY_RETENTION_DAYS = 30
 FAN_DEAD_STREAK = 3  # ~6s at default 2s poll, skips mechanical spin-up on cold start
 SENSOR_RECOVER_STREAK = 3  # consecutive good reads to clear assumed-critical (anti-flap)
+TICK_FAIL_LIMIT = 5  # consecutive tick exceptions before exiting for systemd restart
 EQUILIBRIA_MAXLEN = 20000
 
 
@@ -458,6 +459,10 @@ class Daemon:
         self._load_equilibria()
 
         self.last_fit_t = 0.0
+        # Staggered refit: when the fit interval elapses, all sensors are
+        # queued and one is fit per tick against a shared pool snapshot.
+        self._refit_queue: list[str] = []
+        self._refit_samples: list[EquilibriumSample] = []
         self.last_history_day: list[str] = []
         self._stop = False
         self._last_alarm_t: dict[str, float] = {}
@@ -781,15 +786,28 @@ class Daemon:
                     self._append_equilibrium(sample)
                     w.clear()
 
-        # Periodic refit (per-sensor)
-        if obs.t - self.last_fit_t > self.fit_interval:
-            sample_list = list(self.equilibria)
-            fan_names = list(self.fan_configs.keys())
-            for sm in self.sensor_models.values():
-                sm.fit(sample_list, FEATURE_NAMES, fan_names)
-            save_models(MODEL_PATH, self.sensor_models)
-            self._persist_equilibria_atomic()
+        # Periodic refit, staggered one sensor per tick. Fitting every sensor
+        # against a 20k-sample pool in a single tick can stall the loop past
+        # the watchdog — and a watchdog kill *before* the equilibria rewrite
+        # below was the one genuinely unbounded growth path for
+        # equilibria.jsonl (kill → restart → same heavy first-tick refit →
+        # kill, with appends accumulating and the trim never reached). All
+        # sensors in a cycle fit against the same pool snapshot for
+        # consistency; last_fit_t is set at cycle start so the interval
+        # measures refit-to-refit.
+        if not self._refit_queue and obs.t - self.last_fit_t > self.fit_interval:
+            self._refit_queue = list(self.sensor_models.keys())
+            self._refit_samples = list(self.equilibria)
             self.last_fit_t = obs.t
+        if self._refit_queue:
+            name = self._refit_queue.pop(0)
+            self.sensor_models[name].fit(
+                self._refit_samples, FEATURE_NAMES, list(self.fan_configs.keys())
+            )
+            if not self._refit_queue:
+                save_models(MODEL_PATH, self.sensor_models)
+                self._persist_equilibria_atomic()
+                self._refit_samples = []
 
         # Status JSON v2
         status = self._build_status(
@@ -805,8 +823,6 @@ class Daemon:
                     f.write(json.dumps(status, default=str) + "\n")
             except OSError as exc:
                 log.warning("history append failed: %s", exc)
-
-        sd_notify("WATCHDOG=1")
 
     def _build_status(
         self,
@@ -897,11 +913,38 @@ class Daemon:
                 self.poll_interval,
             )
             next_tick = time.monotonic()
+            consecutive_failures = 0
             while not self._stop:
                 try:
                     self._tick()
+                    consecutive_failures = 0
                 except Exception:
-                    log.exception("tick failed")
+                    consecutive_failures += 1
+                    log.exception("tick failed (%d consecutive)", consecutive_failures)
+                    if consecutive_failures >= TICK_FAIL_LIMIT:
+                        # A loop that can't tick shouldn't keep running with
+                        # stale PWM while the unit reports active. Exit
+                        # non-zero: Restart=on-failure restarts us, and if
+                        # the failure persists systemd's rate limit leaves
+                        # the unit failed with BIOS modes restored (context
+                        # manager + ExecStopPost) — if fand can't run, fans
+                        # go back to BIOS.
+                        sd_notify(
+                            f"STATUS=exiting: {consecutive_failures} "
+                            f"consecutive tick failures"
+                        )
+                        log.error(
+                            "%d consecutive tick failures — exiting for "
+                            "systemd to restart", consecutive_failures,
+                        )
+                        return 1
+                # Watchdog ping covers failed ticks too: a tick that raises
+                # is still a live loop (the failure-streak exit above
+                # backstops persistent breakage); only a *hung* tick should
+                # starve the watchdog. The old ping at the end of _tick()
+                # skipped every exception path, so one slow source plus one
+                # raise could watchdog-kill a healthy daemon.
+                sd_notify("WATCHDOG=1")
                 next_tick += self.poll_interval
                 sleep_for = max(0.0, next_tick - time.monotonic())
                 if sleep_for == 0.0:
