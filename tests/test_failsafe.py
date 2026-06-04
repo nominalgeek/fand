@@ -84,8 +84,9 @@ def test_on_unreadable_alarm_opts_out_of_roar(make_daemon, status_path):
     st = _status(status_path)
     assert _sensor(st, "cpu")["read_state"] == "missing"
     assert not st["any_critical"]
-    # Excluded sensor → no stress → fan idles at pwm_min, not 255.
-    assert d.actuators.set_calls[-1] == ("pwm1", 40)
+    # Excluded sensor → no stress → fan slews down toward pwm_min (was 67
+    # at stress 0.25; −10/tick), never to 255.
+    assert d.actuators.set_calls[-1] == ("pwm1", 57)
 
 
 def test_never_read_optional_source_excluded_not_escalated(make_daemon, status_path):

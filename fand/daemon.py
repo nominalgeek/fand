@@ -360,6 +360,14 @@ class Daemon:
         self.sensor_fail_assume_critical = bool(
             self.config.get("sensor_fail_assume_critical", True)
         )
+        # PWM slew limits (counts per second), asymmetric on purpose: ramp-up
+        # is fast (cooling must never lag a heat surge by much) while
+        # ramp-down is slow, so fan speed follows the demand envelope instead
+        # of per-tick sensor noise. A low-thermal-mass die (GPU) swings
+        # several °C per second under bursty load; without slew the fans
+        # audibly bounce in lockstep. Critical bypasses slew entirely.
+        self.pwm_slew_up = float(self.config.get("pwm_slew_up_per_s", 30.0))
+        self.pwm_slew_down = float(self.config.get("pwm_slew_down_per_s", 5.0))
 
         self.sensors = Sensors(
             ups_name=self.config.get("ups_name", "cyberpower"),
@@ -503,6 +511,7 @@ class Daemon:
         self._last_alarm_t: dict[str, float] = {}
         self._fan_fault_streak: dict[str, int] = {fn: 0 for fn in self.fan_configs}
         self._pwm_fault_streak: dict[str, int] = {fn: 0 for fn in self.fan_configs}
+        self._last_pwm: dict[str, int] = {}  # last applied PWM per fan (slew reference)
 
         log.info(
             "daemon initialized: %d sensors, %d fans, equilibrium_window=%.0fs",
@@ -623,6 +632,19 @@ class Daemon:
             tmp.replace(EQUILIBRIA_PATH)
         except OSError as exc:
             log.warning("equilibria atomic persist failed: %s", exc)
+
+    # ---- PWM slew ------------------------------------------------------------
+
+    def _slew(self, fan_name: str, target: int) -> int:
+        """Limit how fast a fan's PWM may move per tick (asymmetric up/down).
+        First write after startup is unconstrained. Both bounds floor at 1
+        count/tick so a fan can never get stuck."""
+        prev = self._last_pwm.get(fan_name)
+        if prev is None:
+            return target
+        up = max(1, int(round(self.pwm_slew_up * self.poll_interval)))
+        down = max(1, int(round(self.pwm_slew_down * self.poll_interval)))
+        return max(prev - down, min(prev + up, target))
 
     # ---- alarms ------------------------------------------------------------
 
@@ -796,12 +818,15 @@ class Daemon:
                     )
             for fn in self.fan_configs:
                 applied[fn] = 255
+                self._last_pwm[fn] = 255
                 sources[fn] = "critical"
                 breakdowns[fn] = []
         else:
             for fn, fc in self.fan_configs.items():
                 demand, parts = aggregate_demand(fn, fc.cools, stresses, self.sensor_models)
-                pwm = demand_to_pwm(demand, fc.pwm_min)
+                # Slew-limit toward the demand target: fast up, slow down.
+                pwm = self._slew(fn, demand_to_pwm(demand, fc.pwm_min))
+                self._last_pwm[fn] = pwm
                 if self.actuators.set_pwm(fc.pwm_channel, pwm):
                     self._pwm_fault_streak[fn] = 0
                 else:

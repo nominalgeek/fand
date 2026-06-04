@@ -47,6 +47,16 @@ feature_abs_tolerance: 2.0
 sensor_fail_grace_s: 30.0
 sensor_fail_assume_critical: true
 
+# PWM slew limits, in counts per second. Asymmetric on purpose: ramp-up is
+# fast (cooling must not lag a heat surge), ramp-down slow, so fan speed
+# follows the demand envelope instead of per-tick sensor noise — a GPU die
+# has so little thermal mass that its temp (and therefore stress) swings
+# several °C per second under bursty load, and unfiltered fans audibly
+# bounce in lockstep. At the defaults a fan covers 40→255 in ~7 s and bleeds
+# 255→40 over ~43 s. The critical floor bypasses slew (255 immediately).
+pwm_slew_up_per_s: 30.0
+pwm_slew_down_per_s: 5.0
+
 # Re-fit per-sensor ridge regressions every N seconds from the rolling
 # equilibrium pool.
 fit_interval_s: 3600.0
