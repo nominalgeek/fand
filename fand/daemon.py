@@ -70,6 +70,7 @@ SENSOR_RECOVER_STREAK = 3  # consecutive good reads to clear assumed-critical (a
 PWM_WRITE_FAIL_STREAK = 3  # consecutive failed write verifications before re-takeover
 TICK_FAIL_LIMIT = 5  # consecutive tick exceptions before exiting for systemd restart
 EQUILIBRIA_MAXLEN = 20000
+EQUILIBRIA_COMPACT_EVERY = 2000  # appends between forced jsonl rewrites (refit also rewrites)
 
 
 # ---- sd_notify ------------------------------------------------------------
@@ -403,6 +404,27 @@ class Daemon:
                 cools={str(k): float(v) for k, v in cools_raw.items()},
             )
 
+        # Validate operator-editable invariants loudly at startup. An
+        # inverted critical/target loads fine but degenerates stress() into
+        # a step function (span floored at 0.1 °C) — reject it here instead.
+        problems: list[str] = []
+        for name, sc in self.sensor_configs.items():
+            if sc.critical_c <= sc.target_c:
+                problems.append(
+                    f"sensor {name}: critical_c ({sc.critical_c:g}) must be "
+                    f"> target_c ({sc.target_c:g})"
+                )
+        for fn, fc in self.fan_configs.items():
+            if not 0 <= fc.pwm_min <= 255:
+                problems.append(f"fan {fn}: pwm_min {fc.pwm_min} outside [0, 255]")
+            for sn, w in fc.cools.items():
+                if w < 0:
+                    problems.append(f"fan {fn}: cools weight for {sn} is negative ({w:g})")
+        if problems:
+            for p in problems:
+                log.error("zones.yaml: %s", p)
+            raise RuntimeError(f"{len(problems)} zones.yaml validation error(s)")
+
         # Each sensor's cools_seeds dict: {fan_name → seed_weight from that fan's cools entry}
         cools_seeds_by_sensor: dict[str, dict[str, float]] = {
             sn: {} for sn in self.sensor_configs
@@ -416,6 +438,17 @@ class Daemon:
                     )
                     continue
                 cools_seeds_by_sensor[sn][fn] = weight
+
+        # A sensor no fan claims to cool gets monitoring and the critical
+        # floor, but no fan will proactively ramp for it — legitimate for
+        # ambient probes, surprising for anything a fan should be holding
+        # down. Say so once at startup.
+        uncovered = sorted(sn for sn, seeds in cools_seeds_by_sensor.items() if not seeds)
+        if uncovered:
+            log.warning(
+                "sensors in no fan's cools (no proactive cooling, critical "
+                "floor only): %s", ", ".join(uncovered),
+            )
 
         # Per-sensor models
         self.sensor_models: dict[str, SensorModel] = {}
@@ -457,6 +490,7 @@ class Daemon:
             fn: deque(maxlen=self.equilibrium_window_n) for fn in self.fan_configs
         }
         self.equilibria: deque[EquilibriumSample] = deque(maxlen=EQUILIBRIA_MAXLEN)
+        self._equilibria_appends = 0
         self._load_equilibria()
 
         self.last_fit_t = 0.0
@@ -570,9 +604,16 @@ class Daemon:
                 f.write(json.dumps(asdict(sample)) + "\n")
         except OSError as exc:
             log.warning("equilibrium persist failed: %s", exc)
+        # The refit-cycle rewrite is the normal trim; this counter bounds the
+        # file when refits are far apart (long/misconfigured fit_interval_s)
+        # so appends can't outrun the deque cap indefinitely.
+        self._equilibria_appends += 1
+        if self._equilibria_appends >= EQUILIBRIA_COMPACT_EVERY:
+            self._persist_equilibria_atomic()
 
     def _persist_equilibria_atomic(self) -> None:
         """Rewrite equilibria.jsonl from the in-memory deque after each refit."""
+        self._equilibria_appends = 0
         EQUILIBRIA_PATH.parent.mkdir(parents=True, exist_ok=True)
         tmp = EQUILIBRIA_PATH.with_suffix(EQUILIBRIA_PATH.suffix + ".tmp")
         try:
