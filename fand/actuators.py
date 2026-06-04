@@ -7,9 +7,12 @@ Writes go to /sys/class/hwmon/<nct>/pwm{N}. Mode is managed via pwm{N}_enable:
   5 = SmartFan IV / BIOS-defined curve  ← Linux default on this board
 
 We snapshot the original mode + value on startup to /var/lib/fand/saved_pwm.json,
-flip to mode=1, and restore on shutdown. If the snapshot file is missing on restore
-(e.g. dirty crash recovery via systemctl restart), we fall back to mode=5 which is
-the safe BIOS-controlled default.
+flip to mode=1, and restore on shutdown. The snapshot is always written *before*
+any takeover, so a missing snapshot file on restore means fand never touched the
+chip — restore is then a no-op (it must not guess at modes for channels it never
+managed; forcing mode 5 chip-wide would clobber BIOS curves on untouched
+channels, e.g. when ExecStopPost fires after a start that died on a config
+error before takeover).
 """
 
 from __future__ import annotations
@@ -152,6 +155,9 @@ class Actuators:
     # ----- context-manager glue ------------------------------------------
 
     def __enter__(self) -> "Actuators":
+        # INVARIANT: snapshot before take_over. restore_from_disk() relies on
+        # "no snapshot file ⇒ no channel was ever taken over" to make the
+        # no-snapshot restore a safe no-op. Don't reorder.
         self.snapshot()
         # Flip to manual mode first — the nct kernel driver rejects pwm writes
         # while pwm_enable is in mode 5 (BIOS SmartFan), so the old order
@@ -180,35 +186,32 @@ def restore_from_disk(chip_name: str = "nct6799") -> int:
         return 0
     try:
         saved: dict[str, dict[str, int]] = json.loads(SAVED_STATE.read_text())
-        have_snapshot = True
     except (OSError, json.JSONDecodeError) as exc:
-        log.warning("restore: saved state missing/invalid (%s); using mode=%d", exc, DEFAULT_RESTORE_MODE)
-        saved = {}
-        have_snapshot = False
+        # snapshot() runs before take_over() (see Actuators.__enter__), so no
+        # snapshot file means fand never flipped a channel — nothing to undo.
+        # Forcing mode 5 chip-wide here (the old behavior) clobbered BIOS
+        # curves on channels fand never managed, e.g. when ExecStopPost ran
+        # after a start that died on a config error before takeover.
+        log.warning(
+            "restore: saved state missing/invalid (%s); fand never took over — "
+            "leaving chip untouched", exc,
+        )
+        return 0
     n = 0
-    if have_snapshot:
-        # Restore only the channels fand was actually managing — touching
-        # unmanaged channels would clobber whatever BIOS curve owns them.
-        for ch, vals in saved.items():
-            pwm_path = hw / ch
-            enable_path = hw / f"{ch}_enable"
-            if not enable_path.exists():
-                log.warning("restore: %s not present on chip %s; skipping", ch, chip_name)
-                continue
-            mode = vals.get("enable", DEFAULT_RESTORE_MODE)
-            try:
-                if mode == 1 and "pwm" in vals and pwm_path.exists():
-                    pwm_path.write_text(str(vals["pwm"]))
-                enable_path.write_text(str(mode))
-                n += 1
-            except OSError as exc:
-                log.error("restore %s: %s", ch, exc)
-    else:
-        for pwm_enable in sorted(hw.glob("pwm*_enable")):
-            ch = pwm_enable.name.removesuffix("_enable")
-            try:
-                pwm_enable.write_text(str(DEFAULT_RESTORE_MODE))
-                n += 1
-            except OSError as exc:
-                log.error("restore %s: %s", ch, exc)
+    # Restore only the channels fand was actually managing — touching
+    # unmanaged channels would clobber whatever BIOS curve owns them.
+    for ch, vals in saved.items():
+        pwm_path = hw / ch
+        enable_path = hw / f"{ch}_enable"
+        if not enable_path.exists():
+            log.warning("restore: %s not present on chip %s; skipping", ch, chip_name)
+            continue
+        mode = vals.get("enable", DEFAULT_RESTORE_MODE)
+        try:
+            if mode == 1 and "pwm" in vals and pwm_path.exists():
+                pwm_path.write_text(str(vals["pwm"]))
+            enable_path.write_text(str(mode))
+            n += 1
+        except OSError as exc:
+            log.error("restore %s: %s", ch, exc)
     return n
