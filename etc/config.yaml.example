@@ -34,6 +34,19 @@ temp_slope_threshold: 0.05
 feature_cov_threshold: 0.10
 feature_abs_tolerance: 2.0
 
+# Missing-sensor fail-safe. A declared sensor that stops reading holds its
+# last value for sensor_fail_grace_s (it stays inside the stress and critical
+# checks, so a one-poll flake changes nothing). Past the grace window, with
+# sensor_fail_assume_critical true, the sensor is treated as being AT its
+# critical_c — all fans to max + alarm — until it reads again (3 consecutive
+# good reads to clear, so an intermittent source doesn't flap the fans).
+# Set false to alarm-only on sustained loss. Per-sensor override: give a
+# sensor `on_unreadable: critical` or `on_unreadable: alarm` in zones.yaml —
+# e.g. alarm-only for a GPU whose board fans self-manage anyway, while the
+# thermally-tight DDR5 keeps the full roar.
+sensor_fail_grace_s: 30.0
+sensor_fail_assume_critical: true
+
 # Re-fit per-sensor ridge regressions every N seconds from the rolling
 # equilibrium pool.
 fit_interval_s: 3600.0

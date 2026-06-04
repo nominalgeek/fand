@@ -66,6 +66,7 @@ RUN_DIR = Path("/run/fand")
 STATUS_PATH = RUN_DIR / "status.json"
 HISTORY_RETENTION_DAYS = 30
 FAN_DEAD_STREAK = 3  # ~6s at default 2s poll, skips mechanical spin-up on cold start
+SENSOR_RECOVER_STREAK = 3  # consecutive good reads to clear assumed-critical (anti-flap)
 EQUILIBRIA_MAXLEN = 20000
 
 
@@ -178,6 +179,12 @@ class SensorConfig:
     label: str
     target_c: float
     critical_c: float
+    # What to do when the sensor stays unreadable past sensor_fail_grace_s:
+    # 'critical' = assume it's at critical_c (all fans max), 'alarm' = alarm
+    # only. None = use the global sensor_fail_assume_critical default. Set
+    # 'alarm' on sensors with their own protection story (e.g. a GPU whose
+    # board fans aren't host-controllable anyway).
+    on_unreadable: str | None = None
 
 
 @dataclass
@@ -342,6 +349,14 @@ class Daemon:
         self.ntfy_cmd = self.config.get("ntfy_command")
         self.history_enabled = bool(self.config.get("history_enabled", True))
         self.chip_name = self.config.get("chip_name", "nct6799")
+        # Missing-sensor fail-safe: hold the last reading for this long, then
+        # escalate per sensor policy (assume critical_c → all fans max, or
+        # alarm only). An unreadable sensor must never silently lose its
+        # critical floor.
+        self.sensor_fail_grace_s = float(self.config.get("sensor_fail_grace_s", 30.0))
+        self.sensor_fail_assume_critical = bool(
+            self.config.get("sensor_fail_assume_critical", True)
+        )
 
         self.sensors = Sensors(
             ups_name=self.config.get("ups_name", "cyberpower"),
@@ -360,12 +375,19 @@ class Daemon:
 
         self.sensor_configs: dict[str, SensorConfig] = {}
         for name, sc in sensors_raw.items():
+            on_unreadable = sc.get("on_unreadable")
+            if on_unreadable is not None and on_unreadable not in ("critical", "alarm"):
+                raise RuntimeError(
+                    f"sensor {name}: on_unreadable must be 'critical' or 'alarm', "
+                    f"got {on_unreadable!r}"
+                )
             self.sensor_configs[name] = SensorConfig(
                 name=str(name),
                 chip=str(sc["chip"]),
                 label=str(sc["label"]),
                 target_c=float(sc["target_c"]),
                 critical_c=float(sc["critical_c"]),
+                on_unreadable=on_unreadable,
             )
 
         self.fan_configs: dict[str, FanConfig] = {}
@@ -411,6 +433,19 @@ class Daemon:
             )
         load_models_into(MODEL_PATH, self.sensor_models)
 
+        # Missing-sensor fail-safe state. _last_good_* deliberately start
+        # empty: "never read this process-life" is distinguishable from
+        # "read once, then lost", and only the latter can hold/escalate.
+        self._last_good_temp: dict[str, float] = {}
+        self._last_good_t: dict[str, float] = {}
+        self._sensor_ever_read: dict[str, bool] = {sn: False for sn in self.sensor_configs}
+        self._sensor_escalated: dict[str, bool] = {sn: False for sn in self.sensor_configs}
+        self._sensor_recover_streak: dict[str, int] = {sn: 0 for sn in self.sensor_configs}
+
+        # Refuse to start on permanent sensor config errors (raises). Runs
+        # before Actuators so a bad zones.yaml never gets as far as PWM.
+        self._verify_sensors_at_startup()
+
         # Actuators: PWM channels come from fans
         channels = [fc.pwm_channel for fc in self.fan_configs.values()]
         self.actuators = Actuators(channels, chip_name=self.chip_name)
@@ -432,6 +467,51 @@ class Daemon:
             "daemon initialized: %d sensors, %d fans, equilibrium_window=%.0fs",
             len(self.sensor_configs), len(self.fan_configs), self.equilibrium_window_s,
         )
+
+    # ---- startup sensor verification ----------------------------------------
+
+    def _verify_sensors_at_startup(self) -> None:
+        """One read of every declared sensor. A hwmon sensor whose chip or
+        label doesn't resolve is a permanent zones.yaml error (pulled drive,
+        typo) — refuse to start listing every offender, rather than running
+        for months with that sensor silently unprotected. A `gpu` sensor with
+        nvidia-smi absent only warns: the source is optional and may come up
+        later; the runtime fail-safe covers it once it has read at least once.
+
+        Successful reads seed the last-good state so the runtime grace clock
+        starts from a real reading.
+        """
+        obs = self.sensors.read_all()
+        fatal: list[str] = []
+        for name, sc in self.sensor_configs.items():
+            T = _temp_at(obs, sc.chip, sc.label)
+            if T is not None:
+                self._last_good_temp[name] = T
+                self._last_good_t[name] = obs.t
+                self._sensor_ever_read[name] = True
+                continue
+            if sc.chip == "gpu":
+                log.warning(
+                    "sensor %s: nvidia-smi unavailable at startup — optional "
+                    "source; sensor is unprotected until it first reads",
+                    name,
+                )
+                continue
+            chip_temps = obs.hwmon.get(sc.chip)
+            if chip_temps is None:
+                fatal.append(f"{name}: chip {sc.chip!r} not found in hwmon")
+            else:
+                fatal.append(
+                    f"{name}: label {sc.label!r} not found on chip {sc.chip!r} "
+                    f"(present: {sorted(chip_temps)})"
+                )
+        if fatal:
+            for msg in fatal:
+                log.error("startup sensor check: %s", msg)
+            raise RuntimeError(
+                f"{len(fatal)} declared sensor(s) unreadable at startup — "
+                f"fix zones.yaml or remove them"
+            )
 
     # ---- equilibrium persistence -------------------------------------------
 
@@ -514,18 +594,101 @@ class Daemon:
 
         # Read all sensor temperatures; apply per-sensor AR(1) feed-forward
         # correction (only effective once that sensor's α is trained).
-        sensor_temps: dict[str, float] = {}
+        #
+        # Missing-sensor fail-safe: an unreadable sensor must never silently
+        # lose its critical floor. Within sensor_fail_grace_s the last good
+        # reading stands in (the sensor stays inside the stress and critical
+        # checks); past the grace window it escalates per policy — assume
+        # critical_c (→ all fans max via the existing any_critical path) or
+        # alarm-only. fresh_temps holds only values actually read this tick:
+        # it feeds equilibrium learning, so held/synthetic temps can never
+        # poison the ridge fit.
+        sensor_temps: dict[str, float] = {}            # control + status (incl. held)
+        fresh_temps: dict[str, float] = {}             # learning (actually read)
         sensor_effective_temps: dict[str, float] = {}
+        sensor_states: dict[str, str] = {}             # ok | hold | assumed-critical | missing
         for name, sc in self.sensor_configs.items():
             T = _temp_at(obs, sc.chip, sc.label)
-            if T is None:
-                self._alarm(
-                    f"missing:{name}",
-                    f"sensor {name} ({sc.chip}/{sc.label}) unreadable",
+            sm = self.sensor_models[name]
+            if T is not None:
+                fresh_temps[name] = T
+                self._last_good_temp[name] = T
+                self._last_good_t[name] = obs.t
+                self._sensor_ever_read[name] = True
+                T_eff = sm.ff_corrected_temp(T, features)
+                if self._sensor_escalated[name]:
+                    # Anti-flap: an intermittently-readable sensor stays
+                    # escalated until it produces N consecutive good reads.
+                    self._sensor_recover_streak[name] += 1
+                    if self._sensor_recover_streak[name] >= SENSOR_RECOVER_STREAK:
+                        self._sensor_escalated[name] = False
+                        log.info(
+                            "sensor %s readable again (%d consecutive reads) — "
+                            "clearing assumed-critical",
+                            name, SENSOR_RECOVER_STREAK,
+                        )
+                    else:
+                        T_eff = max(T_eff, sc.critical_c)
+                sensor_temps[name] = T
+                sensor_effective_temps[name] = T_eff
+                sensor_states[name] = (
+                    "assumed-critical" if self._sensor_escalated[name] else "ok"
                 )
                 continue
-            sensor_temps[name] = T
-            sensor_effective_temps[name] = self.sensor_models[name].ff_corrected_temp(T, features)
+
+            # Unreadable this tick.
+            self._sensor_recover_streak[name] = 0
+            if not self._sensor_ever_read[name]:
+                # Never read this process-life — an optional source that
+                # hasn't come up (hwmon sensors can't get here: startup
+                # verification either seeded them or refused to start).
+                # No reading to hold and no basis to assume critical.
+                sensor_states[name] = "missing"
+                self._alarm(
+                    f"missing:{name}",
+                    f"sensor {name} ({sc.chip}/{sc.label}) unreadable "
+                    f"(never read since start — unprotected)",
+                )
+                continue
+            age = obs.t - self._last_good_t[name]
+            policy = sc.on_unreadable or (
+                "critical" if self.sensor_fail_assume_critical else "alarm"
+            )
+            if age <= self.sensor_fail_grace_s and not self._sensor_escalated[name]:
+                # Grace hold: last reading stands in, no FF on a held value
+                # (layering a surge prediction onto a stale temp would
+                # double-count; the EMA only updates from real reads).
+                T_hold = self._last_good_temp[name]
+                sensor_temps[name] = T_hold
+                sensor_effective_temps[name] = T_hold
+                sensor_states[name] = "hold"
+                self._alarm(
+                    f"missing:{name}",
+                    f"sensor {name} ({sc.chip}/{sc.label}) unreadable — "
+                    f"holding last reading {T_hold:.1f}°C",
+                    cooldown_s=60.0,
+                )
+            elif policy == "critical":
+                self._sensor_escalated[name] = True
+                # Synthetic critical_c goes into the *effective* map only:
+                # the critical check and stress both read it from there, and
+                # keeping it out of sensor_temps keeps it out of status T and
+                # equilibrium windows.
+                sensor_effective_temps[name] = sc.critical_c
+                sensor_states[name] = "assumed-critical"
+                self._alarm(
+                    f"missing_critical:{name}",
+                    f"sensor {name} ({sc.chip}/{sc.label}) unreadable for "
+                    f"{age:.0f}s — assuming critical, all fans to max",
+                )
+            else:
+                sensor_states[name] = "missing"
+                self._alarm(
+                    f"missing:{name}",
+                    f"sensor {name} ({sc.chip}/{sc.label}) unreadable for "
+                    f"{age:.0f}s — degraded (on_unreadable: alarm)",
+                    cooldown_s=60.0,
+                )
 
         # Global critical check (per sensor)
         any_critical = False
@@ -586,12 +749,14 @@ class Daemon:
             else:
                 self._fan_fault_streak[fn] = 0
 
-        # Per-fan equilibrium collection
+        # Per-fan equilibrium collection. Windows and samples record only
+        # fresh_temps — a held value is flat by construction (dT/dt = 0) and
+        # would both fake equilibrium and feed a stale reading to the fit.
         if not any_critical:
             feature_names = list(features.keys())
             for fn, fc in self.fan_configs.items():
                 w = self.windows[fn]
-                w.append((obs.t, dict(sensor_temps), dict(features), dict(applied)))
+                w.append((obs.t, dict(fresh_temps), dict(features), dict(applied)))
                 if len(w) < self.equilibrium_window_n:
                     continue
                 cooled = list(fc.cools.keys())
@@ -611,7 +776,7 @@ class Daemon:
                         fan=fn,
                         features=dict(features),
                         pwm=dict(applied),
-                        temps=dict(sensor_temps),
+                        temps=dict(fresh_temps),
                     )
                     self._append_equilibrium(sample)
                     w.clear()
@@ -629,7 +794,7 @@ class Daemon:
         # Status JSON v2
         status = self._build_status(
             obs, sensor_temps, sensor_effective_temps, stresses,
-            applied, sources, breakdowns, any_critical,
+            sensor_states, applied, sources, breakdowns, any_critical,
         )
         _atomic_write_json(STATUS_PATH, status)
 
@@ -649,6 +814,7 @@ class Daemon:
         sensor_temps: dict[str, float],
         sensor_effective_temps: dict[str, float],
         stresses: dict[str, float],
+        sensor_states: dict[str, str],
         applied: dict[str, int],
         sources: dict[str, str],
         breakdowns: dict[str, list[tuple[str, float, float, float]]],
@@ -663,6 +829,7 @@ class Daemon:
                 "label": sc.label,
                 "T": sensor_temps.get(name),
                 "T_eff": sensor_effective_temps.get(name),
+                "read_state": sensor_states.get(name, "missing"),
                 "target_c": sc.target_c,
                 "critical_c": sc.critical_c,
                 "stress": stresses.get(name),
@@ -776,7 +943,12 @@ def main(argv: list[str] | None = None) -> int:
         log.info("restored %d channels from %s", n, SAVED_STATE)
         return 0
 
-    daemon = Daemon(config_path=Path(args.config), zones_path=Path(args.zones))
+    try:
+        daemon = Daemon(config_path=Path(args.config), zones_path=Path(args.zones))
+    except RuntimeError as exc:
+        # Config / startup-validation errors: clean message, no traceback.
+        log.error("%s", exc)
+        return 2
     return daemon.run()
 
 

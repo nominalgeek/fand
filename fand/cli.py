@@ -101,6 +101,11 @@ def cmd_status(_args: argparse.Namespace) -> int:
             stress = sn.get("stress")
             stress_str = _fmt_pct(stress)
             marker = " ←" if stress is not None and stress > 0.5 else ""
+            # Sensor-read fail-safe state (daemon holds/escalates unreadable
+            # sensors; see DESIGN.md "Safety properties").
+            read_state = sn.get("read_state")
+            if read_state and read_state != "ok":
+                marker += f" [{read_state.upper()}]"
             print(
                 f"    {sn['name']:<22} {_fmt_T(sn.get('T')):>7} "
                 f"{sn.get('target_c', 0):>5.0f}°C "

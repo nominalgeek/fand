@@ -228,9 +228,17 @@ floors that work without any learned state:
 
 - **Critical floor.** Any sensor at or above its `critical_c` → all fans
   to 255 immediately. Bypasses the model entirely.
-- **Sensor fault.** If a primary sensor reads as None, that doesn't crash —
-  the daemon logs and treats it as "no signal," but other sensors still
-  drive their fans normally.
+- **Sensor fault.** An unreadable sensor never silently loses its critical
+  floor. Startup refuses to run if a declared hwmon sensor's chip/label
+  doesn't resolve (permanent config error). At runtime, a sensor that stops
+  reading holds its last value for a grace window (`sensor_fail_grace_s`,
+  default 30 s — it stays inside the stress and critical checks), then is
+  assumed to be AT its `critical_c` — all fans max + alarm — until it reads
+  again (3 consecutive good reads to clear, so an intermittent source can't
+  flap the fans). Per-sensor `on_unreadable: alarm` opts out of the roar for
+  sensors with their own protection story (e.g. a GPU whose board fans
+  aren't host-controllable anyway). Held/synthetic temps never enter the
+  equilibrium pool, so the fail-safe can't poison the learned model.
 - **Fan-dead detection.** Tach reading 0 RPM while commanded PWM ≥ pwm_min
   for N consecutive ticks → alarm. (N = 3 by default to skip cold-start
   mechanical spin-up.)
