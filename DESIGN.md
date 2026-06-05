@@ -161,9 +161,14 @@ with learned γ.
 The same seed fallback applies if a trained sensor's learned γ comes out
 all-zero (closed-loop data biases γ toward zero — the controller ramps
 fans *because* temps rise, so PWM correlates positively with temperature
-until load features deconfound it). Invariant: learning may refine the
-cooling map, never erase it — a sensor under stress always retains at
-least its calibration-measured fan response.
+until load features deconfound it). The invariant is enforced per fan,
+not just in aggregate: each fan's blended γ is floored at its seed value,
+because observational runtime data cannot causally distinguish "this fan
+doesn't cool this sensor" from controller-induced correlation, while
+phase 3's perturbation is direct causal evidence that it does. Learning
+may refine the cooling map upward, never erase it — a sensor under
+stress always retains at least its calibration-measured fan response.
+Recalibration is the way to lower the floor.
 
 ## How the cooling matrix evolves
 

@@ -342,13 +342,23 @@ class SensorModel:
         # count; fans whose PWM never moved hold pure seed weight regardless
         # of n — sample count is not information about a coefficient the data
         # can't see.
+        #
+        # Each fan's γ is floored at its seed: learning may refine the
+        # cooling map upward, never erase it. Closed-loop runtime data
+        # cannot causally distinguish "this fan doesn't cool this sensor"
+        # from "the controller ramps this fan when this sensor is hot" —
+        # both produce γ → 0 — while phase 3's perturbation is direct
+        # causal evidence that it does. Without the floor, a sensor whose
+        # fit zeroes some fans but not others gets relevance 0 on its
+        # *measured* coolers while an unseeded fan with confounded-positive
+        # γ wins alone. A recalibration is the way to lower the floor.
         trust = min(1.0, n / max(1, self.fully_trained_n))
         seed_pwm_scale = 100.0  # ΔT_phase3 / 100 ≈ γ if fan drops PWM by 100 units
         blended: dict[str, float] = {}
         for fn in fan_names:
             seed_g = self.cools_seeds.get(fn, 0.0) / seed_pwm_scale
             if fn in gamma_dict:
-                blended[fn] = (1 - trust) * seed_g + trust * gamma_dict[fn]
+                blended[fn] = max((1 - trust) * seed_g + trust * gamma_dict[fn], seed_g)
             else:
                 blended[fn] = seed_g
 
