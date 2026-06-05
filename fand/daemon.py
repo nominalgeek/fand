@@ -368,6 +368,16 @@ class Daemon:
         # audibly bounce in lockstep. Critical bypasses slew entirely.
         self.pwm_slew_up = float(self.config.get("pwm_slew_up_per_s", 30.0))
         self.pwm_slew_down = float(self.config.get("pwm_slew_down_per_s", 5.0))
+        # Control-temperature smoothing time constant. Stress is computed
+        # from an EMA of the effective temp rather than the raw reading: a
+        # GPU die reports in whole-°C steps at poll rate, and with a narrow
+        # target→critical span each ±1 °C flicker jolts the demand target by
+        # tens of PWM counts — the slew limiter then saws (fast step up,
+        # slow bleed down) instead of holding steady. Smoothing removes the
+        # quantization flicker while real thermal trends (tens of seconds)
+        # pass through. The CRITICAL check always uses the raw instantaneous
+        # reading — safety never lags. 0 disables smoothing.
+        self.temp_smooth_tau_s = float(self.config.get("temp_smooth_tau_s", 15.0))
 
         self.sensors = Sensors(
             ups_name=self.config.get("ups_name", "cyberpower"),
@@ -512,6 +522,7 @@ class Daemon:
         self._fan_fault_streak: dict[str, int] = {fn: 0 for fn in self.fan_configs}
         self._pwm_fault_streak: dict[str, int] = {fn: 0 for fn in self.fan_configs}
         self._last_pwm: dict[str, int] = {}  # last applied PWM per fan (slew reference)
+        self._temp_ctrl_ema: dict[str, float] = {}  # smoothed control temp per sensor
 
         log.info(
             "daemon initialized: %d sensors, %d fans, equilibrium_window=%.0fs",
@@ -633,6 +644,22 @@ class Daemon:
         except OSError as exc:
             log.warning("equilibria atomic persist failed: %s", exc)
 
+    # ---- control-temp smoothing ----------------------------------------------
+
+    def _smooth_ctrl_temp(self, name: str, T_eff: float) -> float:
+        """EMA of the effective temp, used for stress only (never for the
+        critical check). Seeds on first sample so there's no cold-start lag."""
+        if self.temp_smooth_tau_s <= 0:
+            return T_eff
+        prev = self._temp_ctrl_ema.get(name)
+        if prev is None:
+            self._temp_ctrl_ema[name] = T_eff
+            return T_eff
+        a = min(1.0, self.poll_interval / self.temp_smooth_tau_s)
+        cur = prev + a * (T_eff - prev)
+        self._temp_ctrl_ema[name] = cur
+        return cur
+
     # ---- PWM slew ------------------------------------------------------------
 
     def _slew(self, fan_name: str, target: int) -> int:
@@ -675,7 +702,8 @@ class Daemon:
         # poison the ridge fit.
         sensor_temps: dict[str, float] = {}            # control + status (incl. held)
         fresh_temps: dict[str, float] = {}             # learning (actually read)
-        sensor_effective_temps: dict[str, float] = {}
+        sensor_effective_temps: dict[str, float] = {}  # raw + FF — drives the critical check
+        sensor_ctrl_temps: dict[str, float] = {}       # smoothed — drives stress/demand
         sensor_states: dict[str, str] = {}             # ok | hold | assumed-critical | missing
         for name, sc in self.sensor_configs.items():
             T = _temp_at(obs, sc.chip, sc.label)
@@ -686,6 +714,9 @@ class Daemon:
                 self._last_good_t[name] = obs.t
                 self._sensor_ever_read[name] = True
                 T_eff = sm.ff_corrected_temp(T, features)
+                # EMA tracks the real (pre-escalation) effective temp so an
+                # assumed-critical episode can't pollute it.
+                T_ctrl = self._smooth_ctrl_temp(name, T_eff)
                 if self._sensor_escalated[name]:
                     # Anti-flap: an intermittently-readable sensor stays
                     # escalated until it produces N consecutive good reads.
@@ -699,8 +730,10 @@ class Daemon:
                         )
                     else:
                         T_eff = max(T_eff, sc.critical_c)
+                        T_ctrl = max(T_ctrl, sc.critical_c)
                 sensor_temps[name] = T
                 sensor_effective_temps[name] = T_eff
+                sensor_ctrl_temps[name] = T_ctrl
                 sensor_states[name] = (
                     "assumed-critical" if self._sensor_escalated[name] else "ok"
                 )
@@ -731,6 +764,7 @@ class Daemon:
                 T_hold = self._last_good_temp[name]
                 sensor_temps[name] = T_hold
                 sensor_effective_temps[name] = T_hold
+                sensor_ctrl_temps[name] = self._smooth_ctrl_temp(name, T_hold)
                 sensor_states[name] = "hold"
                 self._alarm(
                     f"missing:{name}",
@@ -740,11 +774,12 @@ class Daemon:
                 )
             elif policy == "critical":
                 self._sensor_escalated[name] = True
-                # Synthetic critical_c goes into the *effective* map only:
-                # the critical check and stress both read it from there, and
-                # keeping it out of sensor_temps keeps it out of status T and
-                # equilibrium windows.
+                # Synthetic critical_c goes into the effective + control maps
+                # only (bypassing the EMA store): the critical check and
+                # stress read from those, and keeping it out of sensor_temps
+                # keeps it out of status T and equilibrium windows.
                 sensor_effective_temps[name] = sc.critical_c
+                sensor_ctrl_temps[name] = sc.critical_c
                 sensor_states[name] = "assumed-critical"
                 self._alarm(
                     f"missing_critical:{name}",
@@ -771,10 +806,12 @@ class Daemon:
                     f"sensor {name} ({sc.chip}/{sc.label}) = {T_eff:.1f}°C ≥ critical {sc.critical_c:.1f}°C",
                 )
 
-        # Per-sensor stress
+        # Per-sensor stress — from the smoothed control temp, so quantization
+        # flicker on low-thermal-mass sensors doesn't jolt the demand target.
+        # (The critical check above used the raw effective temps.)
         stresses: dict[str, float] = {}
-        for name, T_eff in sensor_effective_temps.items():
-            stresses[name] = self.sensor_models[name].stress(T_eff)
+        for name, T_ctrl in sensor_ctrl_temps.items():
+            stresses[name] = self.sensor_models[name].stress(T_ctrl)
 
         # Enable-mode drift: BIOS can reassert pwm_enable behind our back
         # (e.g. after suspend/resume). Write read-back can't catch the case
@@ -924,8 +961,8 @@ class Daemon:
 
         # Status JSON v2
         status = self._build_status(
-            obs, sensor_temps, sensor_effective_temps, stresses,
-            sensor_states, applied, sources, breakdowns, any_critical,
+            obs, sensor_temps, sensor_effective_temps, sensor_ctrl_temps,
+            stresses, sensor_states, applied, sources, breakdowns, any_critical,
         )
         _atomic_write_json(STATUS_PATH, status)
 
@@ -942,6 +979,7 @@ class Daemon:
         obs: Observation,
         sensor_temps: dict[str, float],
         sensor_effective_temps: dict[str, float],
+        sensor_ctrl_temps: dict[str, float],
         stresses: dict[str, float],
         sensor_states: dict[str, str],
         applied: dict[str, int],
@@ -958,6 +996,7 @@ class Daemon:
                 "label": sc.label,
                 "T": sensor_temps.get(name),
                 "T_eff": sensor_effective_temps.get(name),
+                "T_ctrl": sensor_ctrl_temps.get(name),
                 "read_state": sensor_states.get(name, "missing"),
                 "target_c": sc.target_c,
                 "critical_c": sc.critical_c,

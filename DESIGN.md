@@ -136,7 +136,14 @@ At each 2 s poll:
    for three slightly-warm sensors ramps more than one with one
    slightly-warm sensor. `stress^1.5` keeps low-stress sensors from
    piling up to demand = 1 from sheer count.
-5. **Slew-limit the output.** The computed PWM is a *target*; the applied
+5. **Smooth the input.** Stress is computed from an EMA of the effective
+   temp (`temp_smooth_tau_s`, default 15 s), not the raw reading. Sensors
+   quantize in whole-°C steps at poll rate; on a low-thermal-mass die with
+   a narrow target→critical span (GPU: 80→90), each ±1 °C flicker would
+   jolt the demand target by tens of PWM counts. Real trends pass through;
+   flicker averages away. The critical floor (step 3) always reads the raw
+   instantaneous temp — safety never lags this filter.
+6. **Slew-limit the output.** The computed PWM is a *target*; the applied
    PWM moves toward it at most `pwm_slew_up_per_s` counts/s upward and
    `pwm_slew_down_per_s` downward (defaults 30/5). A low-thermal-mass die
    (the GPU) swings several °C per second under bursty load; without

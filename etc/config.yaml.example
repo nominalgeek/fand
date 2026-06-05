@@ -57,6 +57,16 @@ sensor_fail_assume_critical: true
 pwm_slew_up_per_s: 30.0
 pwm_slew_down_per_s: 5.0
 
+# Control-temperature smoothing (seconds). Stress is computed from an EMA of
+# each sensor's effective temp instead of the raw reading: sensors report in
+# whole-°C steps at poll rate, and on a low-thermal-mass die with a narrow
+# target→critical span each ±1 °C flicker jolts the demand target by tens of
+# PWM counts — the slew limiter then saws audibly instead of holding steady.
+# Real thermal trends (tens of seconds) pass through; per-second quantization
+# flicker is averaged away. The CRITICAL floor always uses the raw
+# instantaneous reading — safety never lags this filter. 0 disables.
+temp_smooth_tau_s: 15.0
+
 # Re-fit per-sensor ridge regressions every N seconds from the rolling
 # equilibrium pool.
 fit_interval_s: 3600.0
