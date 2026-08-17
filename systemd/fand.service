@@ -1,0 +1,36 @@
+[Unit]
+Description=fand — adaptive system fan controller
+Documentation=file:/usr/local/lib/fand/
+After=multi-user.target nut-server.service
+Wants=nut-server.service
+
+[Service]
+Type=notify
+NotifyAccess=main
+# Fail closed if the runtime tree has been tampered with — the daemon runs as
+# root and these are the two paths whose contents become root code on start.
+ExecStartPre=/usr/bin/test -O /usr/local/lib/fand/.venv/bin/fand-daemon
+ExecStartPre=/usr/bin/test -O /usr/local/lib/fand/.venv/bin/python
+ExecStart=/usr/local/lib/fand/.venv/bin/fand-daemon
+ExecStopPost=/usr/local/lib/fand/.venv/bin/fand-daemon --restore-bios
+Restart=on-failure
+RestartSec=5
+# Worst-case healthy tick: nvidia-smi timeout (3s) + upsc timeout (2s) +
+# ntfy hook (5s) + one staggered sensor fit — well under 30s. The daemon
+# pings once per tick attempt; only a genuinely hung tick starves this.
+WatchdogSec=30
+
+# Runs as root because PWM writes need it. Narrow the writable surface so a bug
+# can't corrupt anything beyond the hwmon nodes and our own state dirs.
+User=root
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/sys/class/hwmon /etc/fand /var/lib/fand /run/fand
+StateDirectory=fand
+RuntimeDirectory=fand
+ConfigurationDirectory=fand
+
+[Install]
+WantedBy=multi-user.target
